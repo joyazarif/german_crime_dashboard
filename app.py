@@ -20,6 +20,41 @@ print("Lade Daten und initialisiere Dashboard...")
 # Use a light Plotly template
 pio.templates.default = "plotly_white"
 
+# --------- POPULATION (for rates per 100k) ---------
+POP_FILE = "data/population_states.csv"
+
+
+def load_population():
+    pop = pd.read_csv(POP_FILE, sep=";", encoding="utf-8")
+    pop.columns = [c.strip() for c in pop.columns]
+    pop["Bundesland"] = pop["Bundesland"].astype(str).str.strip()
+    pop["Jahr"] = pop["Jahr"].astype(int)
+    pop["Population"] = pop["Population"].astype(float)
+    return pop
+
+
+try:
+    POP = load_population()
+    print("✅ Population loaded:", POP.shape)
+except Exception as e:
+    POP = pd.DataFrame(columns=["Bundesland", "Jahr", "Population"])
+    print("⚠️ Population NOT loaded:", e)
+
+
+def get_population(bundesland: str, year: int):
+    if POP.empty:
+        return None
+    sub = POP[(POP["Bundesland"] == bundesland) & (POP["Jahr"] == int(year))]
+    if not sub.empty:
+        return float(sub["Population"].iloc[0])
+    return None
+
+
+def per_100k(value, population):
+    if population is None or population <= 0:
+        return 0.0
+    return 100000.0 * float(value) / float(population)
+
 
 # --------- THEME COLORS ---------
 HEADER_BG = "#0F1A2A"
@@ -333,39 +368,56 @@ def build_kpis(d):
 
 
 # --------- OVERVIEW FIGURES ---------
-def fig_trend(d):
+def fig_trend(d, metric_mode="abs"):
     """
-    Single-line trend chart styled like
-    'Steigt die Gewalt gegen Frauen an?' (clean, official look)
+    Single-line trend chart.
+    metric_mode:
+        - "abs"  -> absolute victims
+        - "rate" -> victims per 100k inhabitants (Germany)
     """
     if d.empty:
         return empty_fig()
 
-    d2 = d[d["Straftat_kurz"] != "Straftaten insgesamt"]
+    d2 = d[d["Straftat_kurz"] != "Straftaten insgesamt"].copy()
+    if d2.empty:
+        return empty_fig("Keine Deliktsdaten verfügbar")
+
     g = d2.groupby("Jahr")["Oper insgesamt"].sum().reset_index()
-    # --- Year-to-year change ---
     g = g.sort_values("Jahr")
-    g["Delta"] = g["Oper insgesamt"].diff()
+
+    # --- abs vs rate/100k (Germany) ---
+    if metric_mode == "rate":
+        # Requires Deutschland rows in population_states.csv
+        g["Pop_DE"] = g["Jahr"].apply(
+            lambda y: get_population("Deutschland", int(y)))
+        g["Value"] = g.apply(lambda r: per_100k(
+            r["Oper insgesamt"], r["Pop_DE"]), axis=1)
+        y_title = "Opfer pro 100.000 Einwohner"
+        hover_line = "<b>%{x}</b><br>%{y:.2f} pro 100.000<extra></extra>"
+    else:
+        g["Value"] = g["Oper insgesamt"]
+        y_title = "erfasste Fälle"
+        hover_line = "<b>%{x}</b><br>%{y:,} Opfer<extra></extra>"
+
+    # --- year-to-year change based on plotted metric ---
+    g["Delta"] = g["Value"].diff()
 
     fig = go.Figure()
 
     fig.add_trace(
         go.Scatter(
             x=g["Jahr"],
-            y=g["Oper insgesamt"],
+            y=g["Value"],
             mode="lines+markers",
-            name="Gesamt Opferzahl",
-            line=dict(
-                color="#1a80bb",  # strong blue
-                width=4,
-            ),
+            name="Trend",
+            line=dict(color="#1e40af", width=4),
             marker=dict(
                 size=12,
-                symbol="square",  # square point style
-                color="#1a80bb",
+                symbol="square",
+                color="#1e40af",
                 line=dict(color="#1e3a8a", width=1),
             ),
-            hovertemplate="<b>%{x}</b><br>%{y:,} Opfer<extra></extra>",
+            hovertemplate=hover_line,
         )
     )
 
@@ -377,11 +429,15 @@ def fig_trend(d):
 
         arrow_symbol = "▲" if delta >= 0 else "▼"
         arrow_color = "#dc2626" if delta >= 0 else "#16a34a"
-        arrow_text = f"{arrow_symbol} {abs(delta):,}".replace(",", ".")
+
+        if metric_mode == "rate":
+            arrow_text = f"{arrow_symbol} {abs(delta):.2f}"
+        else:
+            arrow_text = f"{arrow_symbol} {abs(delta):,}".replace(",", ".")
 
         fig.add_annotation(
             x=row["Jahr"],
-            y=row["Oper insgesamt"],
+            y=row["Value"],
             text=arrow_text,
             showarrow=True,
             arrowhead=3,
@@ -399,19 +455,20 @@ def fig_trend(d):
     fig.update_layout(
         title="Zeitliche Entwicklung der Opferzahlen",
         xaxis_title="",
-        yaxis_title="erfasste Fälle",
-        height=650,
+        yaxis_title=y_title,
+        height=550,  # you wanted smaller charts
         plot_bgcolor="white",
-        margin=dict(l=70, r=30, t=70, b=90),
+        margin=dict(l=70, r=30, t=70, b=70),
         showlegend=False,
     )
 
+    # horizontal years
     fig.update_xaxes(
         showgrid=True,
         gridcolor="#d1d5db",
         tickmode="linear",
         dtick=1,
-        tickangle=0,
+        tickangle=0,   # <- horizontal
     )
     fig.update_yaxes(showgrid=True, gridcolor="#d1d5db")
 
@@ -1841,6 +1898,17 @@ def sidebar_layout(path):
                 body=True,
                 children=[
                     html.H5("Analysefilter", className="card-title"),
+                    html.Label("Metrik", className="mt-2"),
+                    dcc.Dropdown(
+                        id="filter-metric",
+                        options=[
+                            {"label": "Absolute Opfer", "value": "abs"},
+                            {"label": "Opfer pro 100.000 Einwohner", "value": "rate"},
+                        ],
+                        value="abs",
+                        clearable=False,
+                    ),
+
                     html.Label("Jahr(e)", className="mt-2"),
                     dcc.Dropdown(
                         id="filter-year",
@@ -2125,14 +2193,10 @@ def layout_temporal():
         ]
     )
 
-#Def Layout_Trend is Removed
-
-
-
+# Def Layout_Trend is Removed
 
 
 # Which city is safer or dangerous for children function (now as risk scatter)
-
 
 
 # --------- Helper: Bar chart for children 0–14 Top-N ---------
@@ -2416,27 +2480,27 @@ def update_sidebar_visibility(visible):
         Input("filter-year", "value"),
         Input("filter-crime", "value"),
         Input("filter-state", "value"),
+        Input("filter-metric", "value"),  # ✅ NEW
     ],
 )
-def update_overview(years, crimes, states):
+def update_overview(years, crimes, states, metric_mode):
     """
     Updates the Übersicht page (KPIs + charts) based on the global sidebar filters.
     IMPORTANT: This must be the ONLY callback that outputs crime-pie.figure.
     """
 
-    # Defensive defaults (Dropdowns can return None)
     years = YEARS if not years else years
     crimes = [] if crimes is None else crimes
     states = [] if states is None else states
+    metric_mode = metric_mode or "abs"
 
-    # Filter
     d_filtered = filter_data(years, crimes, states)
 
-    # KPIs
+    # KPIs (still absolute — KPIs usually should not be rate-based)
     kpi1, kpi2, kpi3, kpi4, kpi5 = build_kpis(d_filtered)
 
     # Figures
-    trend_fig = fig_trend(d_filtered)
+    trend_fig = fig_trend(d_filtered, metric_mode=metric_mode)  # ✅ NEW
     gender_fig = fig_gender(d_filtered)
     pie_fig = fig_crime_pie(d_filtered)
 
@@ -2450,6 +2514,7 @@ def update_overview(years, crimes, states):
         gender_fig,
         pie_fig,
     )
+
 
 # --------- GEOGRAPHIC CALLBACKS ---------
 
@@ -2568,11 +2633,9 @@ def update_crime(years, crimes, states, age_crime_sel):
 # Trends Callback: Children 0–14 ranking (map + bar)
 
 
-
 # viollence against Women callback
 
 # fastest growing crimes callback
-
 
 
 # --------- TEMPORAL CALLBACK ---------
