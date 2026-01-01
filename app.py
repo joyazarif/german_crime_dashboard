@@ -703,7 +703,7 @@ def fig_crime_pie(d):
         row=1,
         col=2,
     )
-
+    #Demo chekcpoint
     # ---- Visual connector (wedge) between the two pies (paper coordinates) ----
     # Left pie domain will be roughly x in [0.0, ~0.60], right pie domain in [~0.62, 1.0]
     # We draw a light-grey wedge from the right edge of the left pie to the left edge of the right pie.
