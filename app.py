@@ -2356,8 +2356,6 @@ def render_page(path):
         return layout_crime()
     if path == "/correlations":
         return layout_correlations()
-    if path == "/trends":                     # 🆕 NEW
-        return layout_trends()
     if path == "/temporal":
         return layout_temporal()
     return html.Div([html.H2("404 – Seite nicht gefunden")])
@@ -2565,73 +2563,17 @@ def update_crime(years, crimes, states, age_crime_sel):
 
 
 # Trends Callback (city danger)
-@app.callback(
-    Output("city-danger", "figure"),
-    Input("filter-year", "value"),
-    Input("filter-crime", "value"),
-    Input("filter-state", "value"),
-    Input("city-count", "value"),
-    Input("city-color-scale", "value"),
-)
-def update_city_danger(years, crimes, states, top_n, color_scale):
-    d = filter_data(years or YEARS, crimes or [], states or [])
-    return fig_city_danger(
-        d,
-        top_n=top_n or 10,
-        color_scale=color_scale or "OrRd",
-    )
 
 
 # Trends Callback: Children 0–14 ranking (map + bar)
-@app.callback(
-    Output("trend-children-cities", "figure"),
-    Output("trend-children-bar", "figure"),
-    Input("filter-year", "value"),
-    Input("filter-crime", "value"),
-    Input("filter-state", "value"),
-    Input("trend-children-topn", "value"),
-    Input("trend-children-mode", "value"),
-    Input("trend-age-group", "value"),
-)
-def update_trend_children_cities(years, crimes, states, top_n, mode, age_group):
-    d = filter_data(years or YEARS, crimes or [], states or [])
-    map_fig = fig_children_ranking(
-        d,
-        top_n=top_n or 10,
-        mode=mode or "dangerous",
-        age_group=age_group or "Kinder <14",
-    )
-    bar_fig = fig_children_bar(
-        d,
-        top_n=top_n or 10,
-        mode=mode or "dangerous",
-        age_group=age_group or "Kinder <14",
-    )
-    return map_fig, bar_fig
+
 
 
 # viollence against Women callback
-@app.callback(
-    Output("trend-women-violence", "figure"),
-    Input("filter-year", "value"),
-    Input("filter-crime", "value"),
-    Input("filter-state", "value"),
-)
-def update_trend_violence_women(years, crimes, states):
-    d = filter_data(years or YEARS, crimes or [], states or [])
-    return fig_violence_women(d)
+
 # fastest growing crimes callback
 
 
-@app.callback(
-    Output("trend-fastest-crimes", "figure"),
-    Input("filter-year", "value"),
-    Input("filter-crime", "value"),
-    Input("filter-state", "value"),
-)
-def update_fastest_growing_crimes(years, crimes, states):
-    d = filter_data(years or YEARS, crimes or [], states or [])
-    return fig_fastest_growing_crimes(d)
 
 # --------- TEMPORAL CALLBACK ---------
 
