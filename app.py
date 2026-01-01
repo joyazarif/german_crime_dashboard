@@ -1098,11 +1098,44 @@ def prepare_city_geo_data(d, selected_state=None, value_col="Oper insgesamt", ag
     return gdf_merged, geojson_data, (center_lat, center_lon)
 
 
+
 # ----- COLOR SCALES FOR SAFETY MODE -----
 COLOR_SCALE_UNSAFE = "Reds"
 # Safe mode: green-only scale, REVERSED so that LOWER crime = DARKER green
 COLOR_SCALE_SAFE = "Greens_r"
 COLOR_SCALE_ALL = "OrRd"
+
+
+# ----- MAP FOCUS (Germany only) -----
+# Bounding box for Germany in WGS84 (lon/lat). Used to keep the map from drifting to other countries.
+GERMANY_BOUNDS = {"west": 5.5, "east": 15.7, "south": 47.0, "north": 55.6}
+
+
+def _bounds_from_gdf(gdf: gpd.GeoDataFrame, pad: float = 0.4):
+    """Compute a padded WGS84 bounding box from a GeoDataFrame."""
+    try:
+        g = gdf.to_crs("EPSG:4326")
+        minx, miny, maxx, maxy = g.total_bounds
+        return {
+            "west": float(minx - pad),
+            "south": float(miny - pad),
+            "east": float(maxx + pad),
+            "north": float(maxy + pad),
+        }
+    except Exception:
+        return GERMANY_BOUNDS
+
+
+def _apply_map_focus(fig: go.Figure, bounds: dict, center: dict, zoom: float):
+    """Force Mapbox view to stay within bounds (prevents showing surrounding countries too much)."""
+    fig.update_layout(
+        mapbox=dict(
+            center=center,
+            zoom=zoom,
+            bounds=bounds,
+        )
+    )
+    return fig
 
 
 def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all", safety_mode="all"):
@@ -1218,9 +1251,33 @@ def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all",
             )
 
         fig.update_layout(
-            margin={"l": 0, "r": 0, "t": 0, "b": 0},
-            height=500,
-            clickmode="event+select"
+            margin={"l": 0, "r": 50, "t": 0, "b": 0},
+            height=420,
+            clickmode="event+select",
+        )
+
+        # Small colorbar (full height, compact thickness)
+        fig.update_coloraxes(
+            showscale=True,
+            colorbar=dict(
+                title="",
+                len=1.0,           # full height
+                lenmode="fraction",
+                thickness=10,      # thinner
+                x=1.02,            # just outside the map
+                y=0.5,
+                yanchor="middle",
+                outlinewidth=0,
+            ),
+        )
+
+        # Keep the map focused on Germany
+        bounds = _bounds_from_gdf(gdf_states_data, pad=0.35)
+        _apply_map_focus(
+            fig,
+            bounds=bounds,
+            center={"lat": 51.0, "lon": 10.2},
+            zoom=5.6,
         )
 
         return fig
@@ -1305,10 +1362,37 @@ def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all",
         )
 
     fig.update_layout(
-        margin={"l": 0, "r": 0, "t": 0, "b": 0},
-        height=550,
-        clickmode="none"
+        margin={"l": 0, "r": 50, "t": 0, "b": 0},
+        height=420,
+        clickmode="none",
     )
+
+    # Small colorbar (full height, compact thickness)
+    fig.update_coloraxes(
+        showscale=True,
+        colorbar=dict(
+            title="",
+            len=1.0,
+            lenmode="fraction",
+            thickness=10,
+            x=1.02,
+            y=0.5,
+            yanchor="middle",
+            outlinewidth=0,
+        ),
+    )
+
+    # Keep map focused (Germany or selected Bundesland)
+    if selected_state:
+        bounds = _bounds_from_gdf(gdf_plot, pad=0.15)
+        zoom_val = 6.6
+        center_val = {"lat": center_lat, "lon": center_lon}
+    else:
+        bounds = GERMANY_BOUNDS
+        zoom_val = 5.6
+        center_val = {"lat": 51.0, "lon": 10.2}
+
+    _apply_map_focus(fig, bounds=bounds, center=center_val, zoom=zoom_val)
 
     return fig
 
@@ -1328,6 +1412,9 @@ def fig_geo_state_bar(d):
         .sort_values("Oper insgesamt", ascending=True)
     )
 
+    # Add formatted label column for value labels
+    g["Label"] = g["Oper insgesamt"].apply(format_int)
+
     # Normalize values for smooth color scaling
     min_val = g["Oper insgesamt"].min()
     max_val = g["Oper insgesamt"].max()
@@ -1336,30 +1423,33 @@ def fig_geo_state_bar(d):
     # Create figure
     fig = go.Figure()
 
-    # --- Lollipop stem (neutral color) ---
+    # --- Lollipop stem (blue-grey color for consistency) ---
     fig.add_trace(
         go.Scatter(
             x=g["Oper insgesamt"],
             y=g["Bundesland"],
             mode="lines",
-            line=dict(color="#bfbfbf", width=2),
+            line=dict(color="#94a3b8", width=2),
             hoverinfo="skip",
             showlegend=False,
         )
     )
 
-    # --- Lollipop dot (red intensity color) ---
+    # --- Lollipop dot (blue intensity color) with value labels ---
     fig.add_trace(
         go.Scatter(
             x=g["Oper insgesamt"],
             y=g["Bundesland"],
-            mode="markers",
+            mode="markers+text",
+            text=g["Label"],
+            textposition="middle right",
+            textfont=dict(size=12, color="#0f172a"),
             marker=dict(
                 size=14,
                 color=norm,                         # mapped intensity
-                colorscale="Reds",                  # red scale
+                colorscale="Blues",                 # blue scale
                 showscale=False,                    # hide colorbar
-                line=dict(color="black", width=0.6),
+                line=dict(color="#1e40af", width=0.6),
             ),
             hovertemplate="<b>%{y}</b><br>Opfer: %{x}<extra></extra>",
             showlegend=False,
@@ -1371,13 +1461,17 @@ def fig_geo_state_bar(d):
         title="Opfer nach Bundesland",
         xaxis_title="Opferzahl",
         yaxis_title="Bundesland",
-        height=500,
+        height=420,
         margin=dict(l=80, r=20, t=60, b=40),
         plot_bgcolor="white",
     )
 
     fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb")
     fig.update_yaxes(showgrid=False)
+
+    # Increase x-axis range to give room for value labels
+    max_x = float(g["Oper insgesamt"].max()) if not g.empty else 0.0
+    fig.update_xaxes(range=[0, max_x * 1.12 if max_x > 0 else 1])
 
     return fig
 
@@ -1395,23 +1489,32 @@ def fig_geo_top(d):
         .sort_values("Oper insgesamt")
     )
 
+    # Add formatted label column for value labels
+    g["Label"] = g["Oper insgesamt"].apply(format_int)
+
     fig = px.bar(
         g,
         x="Oper insgesamt",
-        y="Region",               # <-- Only city names
+        y="Region",               # <-- Only Landkreis names
         orientation="h",
-        color="Oper insgesamt",
-        color_continuous_scale="Reds",
-        title="Top 10 Städte / Regionen nach Opferzahl",
-        labels={"Oper insgesamt": "Opferzahl", "Region": "Stadt / Region"},
+        text="Label",
+        title="Top 10 Landkreise nach Opferzahl",
+        labels={"Oper insgesamt": "Opferzahl", "Region": "Landkreis"},
     )
+
+    # Set static blue color for all bars
+    fig.update_traces(
+        marker_color="#1a80bb"  # same blue as Zeitliche Einblicke (Change 2019–2024)
+    )
+    # Show value labels at the end of bars
+    fig.update_traces(textposition="outside", cliponaxis=False)
 
     fig.update_layout(
         coloraxis_showscale=False,
         xaxis_title="Opferzahl",
-        yaxis_title="Stadt / Region",
-        height=550,
-        margin=dict(l=80, r=20, t=50, b=40),
+        yaxis_title="Landkreis",
+        height=420,
+        margin=dict(l=80, r=80, t=50, b=40),
     )
 
     return fig
@@ -2137,47 +2240,6 @@ def layout_geo():
     return html.Div(
         children=[
             html.H2("Geografische Analyse", className="mb-3"),
-            html.P(
-                "Vergleich der Opferzahlen nach Bundesland und Städten/Landkreisen. "
-                "Klicken Sie auf ein Bundesland, um die Städteansicht aufzurufen.",
-                className="text-muted",
-            ),
-            html.Div(
-                id="state-info",
-                style={
-                    "backgroundColor": "#f0f9ff",
-                    "padding": "10px",
-                    "borderRadius": "5px",
-                    "marginBottom": "20px",
-                    "borderLeft": "4px solid #3b82f6"
-                },
-                children=[
-                    html.Div(
-                        id="current-state-display",
-                        children="Aktuelle Ansicht: Deutschland – Ebene: Bundesländer"
-                    ),
-                    html.Div(
-                        id="state-back-button",
-                        style={"display": "none"},
-                        children=[
-                            html.Button(
-                                "← Zurück zur Deutschland-Ansicht",
-                                id="back-to-germany",
-                                n_clicks=0,
-                                style={
-                                    "backgroundColor": "#3b82f6",
-                                    "color": "white",
-                                    "border": "none",
-                                    "padding": "5px 10px",
-                                    "borderRadius": "3px",
-                                    "cursor": "pointer",
-                                    "marginTop": "10px"
-                                }
-                            )
-                        ]
-                    )
-                ]
-            ),
 
             # Store bleibt, weil wir weiterhin per Klick Bundesland auswählen
             dcc.Store(id="selected-state-store", data=None),
@@ -2189,10 +2251,10 @@ def layout_geo():
                     "gap": "16px",
                     "marginBottom": "20px",
                     "padding": "12px",
-                    "backgroundColor": "#eef2ff",
+                    "backgroundColor": "#ffffff",  # same as main page
                     "borderRadius": "8px",
-                    "border": "1px solid #c7d2fe",
-                    "maxWidth": "900px",
+                    "border": "none",              # remove differentiation
+                    "width": "100%",
                 },
                 children=[
                     # --- Ansicht / Anzahl Städte ---
@@ -2200,15 +2262,48 @@ def layout_geo():
                         style={"flex": "1"},
                         children=[
                             html.Label("Ansicht"),
-                            dcc.Dropdown(
-                                id="geo-city-mode",
-                                options=[
-                                    {"label": "Bundesländer",
-                                        "value": "bundesland"},
-                                    {"label": "Städte", "value": "all"},
+                            html.Div(
+                                style={"display": "flex", "alignItems": "center", "gap": "12px"},
+                                children=[
+                                    # Back button (appears only on Landkreis level)
+                                    html.Div(
+                                        id="state-back-button",
+                                        style={"display": "none"},
+                                        children=[
+                                            html.Button(
+                                                "← Zurück",
+                                                id="back-to-germany",
+                                                n_clicks=0,
+                                                style={
+                                                    "backgroundColor": HEADER_BG,
+                                                    "color": "white",
+                                                    "border": "none",
+                                                    "padding": "6px 10px",
+                                                    "borderRadius": "6px",
+                                                    "cursor": "pointer",
+                                                },
+                                            )
+                                        ],
+                                    ),
+                                    # Ansicht radios
+                                    dcc.RadioItems(
+                                        id="geo-city-mode",
+                                        options=[
+                                            {"label": " Bundesländer", "value": "bundesland"},
+                                            {"label": " Städte", "value": "all"},
+                                        ],
+                                        value="bundesland",
+                                        labelStyle={
+                                            "display": "inline-block",
+                                            "marginRight": "18px",
+                                            "fontWeight": "600",
+                                        },
+                                        inputStyle={
+                                            "marginRight": "6px",
+                                            "accentColor": HEADER_BG,
+                                        },
+                                    ),
                                 ],
-                                value="bundesland",
-                                clearable=False,
                             ),
                         ],
                     ),
@@ -2221,9 +2316,12 @@ def layout_geo():
                             dcc.Dropdown(
                                 id="geo-age-group",
                                 options=(
-                                    [{"label": "Alle Altersgruppen", "value": "all"}]
+                                    [{"label": "Alle", "value": "all"}]
                                     + [
-                                        {"label": label, "value": label}
+                                        {
+                                            "label": label.split()[1] if "<" in label or "+" in label else label,
+                                            "value": label,
+                                        }
                                         for label in AGE_COLS.keys()
                                     ]
                                 ),
@@ -2233,19 +2331,42 @@ def layout_geo():
                         ],
                     ),
 
-                    # --- Sicherheitsmodus ---
+                    # --- Modus + Aktuelle Ansicht (NO back button here) ---
                     html.Div(
-                        style={"flex": "1"},
+                        style={"flex": "1", "display": "flex", "flexDirection": "column"},
                         children=[
                             html.Label("Modus"),
-                            dcc.Dropdown(
-                                id="geo-safety-mode",
-                                options=[
-                                    {"label": "Gefährlich", "value": "unsafe"},
-                                    {"label": "Sicher", "value": "safe"},
+                            html.Div(
+                                style={
+                                    "display": "flex",
+                                    "alignItems": "center",
+                                    "gap": "14px",
+                                },
+                                children=[
+                                    dcc.RadioItems(
+                                        id="geo-safety-mode",
+                                        options=[
+                                            {"label": " Gefährlich", "value": "unsafe"},
+                                            {"label": " Sicher", "value": "safe"},
+                                        ],
+                                        value="unsafe",
+                                        labelStyle={
+                                            "display": "inline-block",
+                                            "marginRight": "16px",
+                                            "fontWeight": "600",
+                                        },
+                                        inputStyle={
+                                            "marginRight": "6px",
+                                            "accentColor": HEADER_BG,
+                                        },
+                                    ),
+                                    # Current view display (kept)
+                                    html.Div(
+                                        id="current-state-display",
+                                        children="",
+                                        style={"display": "none"},
+                                    ),
                                 ],
-                                value="unsafe",
-                                clearable=False,
                             ),
                         ],
                     ),
@@ -2253,11 +2374,42 @@ def layout_geo():
             ),
             # ===== ENDE FILTERLEISTE =====
 
-            dcc.Graph(id="map"),
-            html.Br(),
-            dcc.Graph(id="statebar"),
-            html.Br(),
-            dcc.Graph(id="topregions"),
+            dbc.Row(
+                [
+                    # LEFT: Map preview (~55%)
+                    dbc.Col(
+                        [
+                            dcc.Graph(
+                                id="map",
+                                style={"height": "420px"},
+                                config={"displayModeBar": False},
+                            ),
+                        ],
+                        md=7,
+                        xs=12,
+                    ),
+
+                    # RIGHT: Analytical charts (~45%)
+                    dbc.Col(
+                        [
+                            dcc.Graph(
+                                id="geo-crime-profile",
+                                style={"height": "420px"},
+                                config={"displayModeBar": False},
+                            ),
+                            html.Div(style={"height": "12px"}),
+                            dcc.Graph(
+                                id="geo-trend",
+                                style={"height": "420px"},
+                                config={"displayModeBar": False},
+                            ),
+                        ],
+                        md=5,
+                        xs=12,
+                    ),
+                ],
+                className="g-3",
+            ),
         ]
     )
 
@@ -2688,8 +2840,8 @@ def update_selected_state(click_data, back_clicks, filter_states, current_state)
 
 @app.callback(
     Output("map", "figure"),
-    Output("statebar", "figure"),
-    Output("topregions", "figure"),
+    Output("geo-trend", "figure"),
+    Output("geo-crime-profile", "figure"),
     Output("current-state-display", "children"),
     Output("state-back-button", "style"),
     Input("filter-year", "value"),
@@ -2771,3 +2923,52 @@ def update_temporal(years, crimes, states):
 
 if __name__ == "__main__":
     app.run(debug=True)
+
+# --------- GEO FULL ANALYTICAL CALLBACK ---------
+
+# This callback reads selected-state-store and updates map + the two analytical charts (geo-crime-profile, geo-trend)
+@app.callback(
+    Output("map", "figure"),
+    Output("geo-crime-profile", "figure"),
+    Output("geo-trend", "figure"),
+    Input("filter-year", "value"),
+    Input("filter-crime", "value"),
+    Input("filter-state", "value"),
+    Input("geo-city-mode", "value"),
+    Input("geo-age-group", "value"),
+    Input("geo-safety-mode", "value"),
+    Input("selected-state-store", "data"),
+)
+def update_geo_full_analysis(
+    years, crimes, states,
+    geo_city_mode, geo_age_group, geo_safety_mode,
+    selected_state,
+):
+    # Apply global filters
+    d_filtered = filter_data(years, crimes, states)
+
+    # Decide drill level
+    if geo_city_mode == "bundesland" or selected_state is None:
+        map_fig = fig_geo_map(
+            d_filtered,
+            selected_state=None,
+            city_mode="bundesland",
+            age_group=geo_age_group,
+            safety_mode=geo_safety_mode,
+        )
+        side_df = d_filtered
+    else:
+        map_fig = fig_geo_map(
+            d_filtered,
+            selected_state=selected_state,
+            city_mode="all",
+            age_group=geo_age_group,
+            safety_mode=geo_safety_mode,
+        )
+        side_df = d_filtered[d_filtered["Bundesland"] == selected_state]
+
+    # Analytical charts (structure + trend)
+    crime_profile_fig = fig_top5(side_df)
+    trend_fig = fig_trend(side_df, metric_mode="abs")
+
+    return map_fig, crime_profile_fig, trend_fig
