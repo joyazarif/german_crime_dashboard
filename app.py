@@ -410,12 +410,12 @@ def fig_trend(d, metric_mode="abs"):
             y=g["Value"],
             mode="lines+markers",
             name="Trend",
-            line=dict(color="#1e40af", width=4),
+            line=dict(color="#0f172a", width=4),   # ⬅ black line
             marker=dict(
                 size=12,
                 symbol="square",
-                color="#1e40af",
-                line=dict(color="#1e3a8a", width=1),
+                color="#0f172a",                  # ⬅ black markers
+                line=dict(color="#0f172a", width=1),
             ),
             hovertemplate=hover_line,
         )
@@ -1874,7 +1874,7 @@ def fig_gender(d):
         title="Geschlechtervergleich nach Deliktsgruppe",
         barmode="overlay",
         xaxis=dict(
-            title="Opferzahl (links: männlich, rechts: weiblich)",
+            title="Opferzahl nach Geschlecht",
             range=[-(max_x + pad), (max_x + pad)],
             showgrid=True,
             gridcolor="#e5e7eb",
