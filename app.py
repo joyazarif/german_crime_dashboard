@@ -35,7 +35,7 @@ def load_population():
 
 try:
     POP = load_population()
-    print("✅ Population loaded:", POP.shape)
+    print(" Population loaded:", POP.shape)
 except Exception as e:
     POP = pd.DataFrame(columns=["Bundesland", "Jahr", "Population"])
     print("⚠️ Population NOT loaded:", e)
@@ -887,7 +887,8 @@ def prepare_state_geo_data(d, value_col="Oper insgesamt", age_group_col=None):
     else:
         gdf_merged["Opfer_altersgruppe"] = 0
 
-    # --- Defensive: ensure unique column names after merges (Plotly requires this) ---
+    # --- Consolidate duplicate columns (handles _x/_y suffixes after merges) ---
+    gdf_merged = _consolidate_duplicate_columns(gdf_merged)
     if gdf_merged.columns.duplicated().any():
         gdf_merged = gdf_merged.loc[:, ~gdf_merged.columns.duplicated()]
 
@@ -923,6 +924,43 @@ def _norm_admin_name(x: str) -> str:
     x = re.sub(r"[^a-z0-9\s-]", " ", x)
     x = re.sub(r"\s+", " ", x).strip()
     return x
+
+
+def _consolidate_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Consolidate duplicate column groups that differ only by merge suffixes
+    (e.g., 'Opfer_insgesamt', 'Opfer_insgesamt_x', 'Opfer_insgesamt_y').
+
+    Strategy:
+    - For each base name (remove trailing _x/_y), if multiple candidates exist:
+      - choose the candidate with the most non-null values as the 'best'
+      - fill NA in 'best' from others, drop the other candidates
+      - finally rename 'best' back to the base name
+    """
+    cols = list(df.columns)
+    groups = {}
+    for c in cols:
+        base = re.sub(r'(_x|_y)$', '', c)
+        groups.setdefault(base, []).append(c)
+
+    for base, candidates in groups.items():
+        if len(candidates) <= 1:
+            continue
+        # choose the column with most non-null values
+        best = max(candidates, key=lambda col: df[col].notna().sum())
+        for c in candidates:
+            if c == best:
+                continue
+            df[best] = df[best].fillna(df[c])
+            df.drop(columns=[c], inplace=True)
+        if best != base:
+            df.rename(columns={best: base}, inplace=True)
+
+    # Final fallback: drop literal duplicate labels if any remain
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+
+    return df
 
 
 def prepare_city_geo_data(d, selected_state=None, value_col="Oper insgesamt", age_group_col=None):
@@ -1034,7 +1072,8 @@ def prepare_city_geo_data(d, selected_state=None, value_col="Oper insgesamt", ag
     # Merge into GeoDataFrame using BOTH keys (Bundesland + City)
     gdf_merged = gdf_subset.merge(
         matched_city, on=["Bundesland", "City"], how="left")
-    # --- Defensive: ensure unique column names after merges (Plotly requires this) ---
+    # --- Consolidate duplicate columns (handles _x/_y suffixes after merges) ---
+    gdf_merged = _consolidate_duplicate_columns(gdf_merged)
     if gdf_merged.columns.duplicated().any():
         gdf_merged = gdf_merged.loc[:, ~gdf_merged.columns.duplicated()]
     gdf_merged["Opfer_insgesamt"] = gdf_merged["Opfer_insgesamt"].fillna(0)
@@ -1116,26 +1155,47 @@ def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all",
         gdf_states_data = gdf_states_data.sort_values(
             metric_col, ascending=ascending)
 
-        fig = px.choropleth_map(
-            gdf_states_data,
-            geojson=geojson_data,
-            locations=gdf_states_data.index,
-            color=metric_col,
-            hover_name="Bundesland",
-            hover_data={
-                metric_col: True,
-                "Opfer_insgesamt": True,
-                "Bundesland": False
-            },
-            custom_data=["Bundesland", metric_col,
-                         "Opfer_insgesamt"],
-            opacity=0.7,
-            map_style="carto-positron",
-            color_continuous_scale=color_scale,
-            zoom=4.5,
-            center={"lat": 51.0, "lon": 10.2},
-            title=f"Opfer nach Bundesland – {age_label_for_title}",
-        )
+        # Debug: print columns to capture potential duplicates before plotting
+        print('DEBUG: gdf_states_data cols:', list(gdf_states_data.columns))
+        print('DEBUG: gdf_states_data duplicated:',
+              gdf_states_data.columns[gdf_states_data.columns.duplicated()].tolist())
+
+        # Build custom_data avoiding duplicates (metric_col may equal 'Opfer_insgesamt')
+        if age_group != "all":
+            custom_data_states = ["Bundesland", metric_col, "Opfer_insgesamt", "Opfer_altersgruppe"]
+        else:
+            custom_data_states = ["Bundesland", metric_col]
+        custom_data_states = list(dict.fromkeys(custom_data_states))
+
+        try:
+            fig = px.choropleth_map(
+                gdf_states_data,
+                geojson=geojson_data,
+                locations=gdf_states_data.index,
+                color=metric_col,
+                hover_name="Bundesland",
+                hover_data={
+                    metric_col: True,
+                    "Opfer_insgesamt": True,
+                    "Bundesland": False
+                },
+                custom_data=custom_data_states,
+                opacity=0.7,
+                map_style="carto-positron",
+                color_continuous_scale=color_scale,
+                zoom=4.5,
+                center={"lat": 51.0, "lon": 10.2},
+                title=f"Opfer nach Bundesland – {age_label_for_title}",
+            )
+        except Exception as e:
+            print("Error creating choropleth for states:", e)
+            try:
+                print('gdf_states_data cols:', list(gdf_states_data.columns))
+                print('gdf_states_data duplicated:',
+                      gdf_states_data.columns[gdf_states_data.columns.duplicated()].tolist())
+            except Exception:
+                pass
+            raise
 
         # Hovertemplate: always show metric_label, total, and age group if selected
         if age_group != "all":
@@ -1185,28 +1245,42 @@ def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all",
         gdf_plot = gdf_rank.sort_values(
             metric_col, ascending=ascending).head(city_mode)
 
-    fig = px.choropleth_map(
-        gdf_plot,
-        geojson=geojson_data,
-        locations=gdf_plot.index,
-        color=metric_col,
-        hover_name="City",
-        hover_data={
-            metric_col: True,
-            "Opfer_insgesamt": True,
-            "Opfer_altersgruppe": True,
-            "Bundesland": True,
-            "City": False
-        },
-        custom_data=["City", "Bundesland", metric_col,
-                     "Opfer_insgesamt", "Opfer_altersgruppe"],
-        opacity=0.8,
-        map_style="carto-positron",
-        color_continuous_scale=color_scale,
-        zoom=6 if selected_state else 5,
-        center={"lat": center_lat, "lon": center_lon},
-        title=f"Opfer – Städteansicht – {age_label_for_title}",
-    )
+    try:
+        fig = px.choropleth_map(
+            gdf_plot,
+            geojson=geojson_data,
+            locations=gdf_plot.index,
+            color=metric_col,
+            hover_name="City",
+            hover_data={
+                metric_col: True,
+                "Opfer_insgesamt": True,
+                "Opfer_altersgruppe": True,
+                "Bundesland": True,
+                "City": False
+            },
+            # Build custom_data avoiding duplicates
+            # When age_group == 'all' metric_col == 'Opfer_insgesamt', so avoid adding it twice
+            custom_data=(lambda: (list(dict.fromkeys([
+                "City", "Bundesland", metric_col,
+                "Opfer_insgesamt", "Opfer_altersgruppe"
+            ]))))(),
+            opacity=0.8,
+            map_style="carto-positron",
+            color_continuous_scale=color_scale,
+            zoom=6 if selected_state else 5,
+            center={"lat": center_lat, "lon": center_lon},
+            title=f"Opfer – Städteansicht – {age_label_for_title}",
+        )
+    except Exception as e:
+        print("Error creating choropleth for cities:", e)
+        try:
+            print('gdf_plot cols:', list(gdf_plot.columns))
+            print('gdf_plot duplicated:',
+                  gdf_plot.columns[gdf_plot.columns.duplicated()].tolist())
+        except Exception:
+            pass
+        raise
 
     # Hovertemplate: always show metric_label, total, and age group if selected
     if age_group != "all":
