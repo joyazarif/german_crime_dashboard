@@ -1718,26 +1718,78 @@ def fig_state_trend(d):
 def fig_diverg(d):
     if d.empty:
         return empty_fig()
+
     years = sorted(d["Jahr"].unique())
     if len(years) < 2:
         return empty_fig("Mindestens zwei Jahre notwendig.")
+
     first, last = years[0], years[-1]
+
     g = d.groupby(["Bundesland", "Jahr"])["Oper insgesamt"].sum().reset_index()
     start = g[g["Jahr"] == first].set_index("Bundesland")["Oper insgesamt"]
     end = g[g["Jahr"] == last].set_index("Bundesland")["Oper insgesamt"]
+
     diff = (end - start).dropna().reset_index()
     diff.columns = ["Bundesland", "Delta"]
     diff = diff.sort_values("Delta")
-    colors = ["#10b981" if x < 0 else "#ef4444" for x in diff["Delta"]]
+
+    # colors (keep yours)
+    colors = ["#9ca3af" if x < 0 else "#1a80bb" for x in diff["Delta"]]
+
+    # labels (German thousands + plus sign)
+    def fmt_de(x):
+        s = f"{int(round(x)):,}".replace(",", ".")
+        return f"+{s}" if x > 0 else s
+
+    diff["Label"] = diff["Delta"].apply(fmt_de)
+
     fig = go.Figure(
         go.Bar(
             x=diff["Delta"],
             y=diff["Bundesland"],
             orientation="h",
-            marker_color=colors,
+            marker=dict(
+                color=colors,
+                line=dict(color="white", width=0.8),  # subtle separation
+            ),
+            text=diff["Label"],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>Δ Opfer: %{x:,}<extra></extra>",
         )
     )
-    fig.update_layout(title=f"Veränderung der Opferzahlen {first} → {last}")
+
+    # zero reference line (clean diverging look)
+    fig.add_vline(x=0, line_width=2, line_color="#0f172a", opacity=0.9)
+
+    # symmetric-ish range so positives/negatives feel balanced
+    max_abs = float(np.max(np.abs(diff["Delta"]))) if len(diff) else 1.0
+    pad = max_abs * 0.18
+
+    fig.update_layout(
+        title=f"Veränderung der Opferzahlen {first} → {last}",
+        height=550,
+        barmode="overlay",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=dict(l=120, r=70, t=70, b=40),
+        font=dict(family="Inter, system-ui, -apple-system, Segoe UI, sans-serif",
+                  size=12, color="#0f172a"),
+    )
+
+    fig.update_xaxes(
+        title="Differenz der Opferzahlen",
+        range=[-max_abs - pad, max_abs + pad],
+        showgrid=True,
+        gridcolor="#e5e7eb",
+        zeroline=False,
+        tickformat=",",  # keeps nice ticks
+    )
+    fig.update_yaxes(
+        title="",
+        showgrid=False,
+    )
+
     return fig
 
 
@@ -2627,17 +2679,6 @@ def update_crime(years, crimes, states, age_crime_sel):
     return heat_fig, stacked_fig, age_fig, top5_fig
 
 
-# Trends Callback (city danger)
-
-
-# Trends Callback: Children 0–14 ranking (map + bar)
-
-
-# viollence against Women callback
-
-# fastest growing crimes callback
-
-
 # --------- TEMPORAL CALLBACK ---------
 
 
@@ -2656,5 +2697,3 @@ def update_temporal(years, crimes, states):
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-print("Fertig geladen. Starte Dashboard...")
