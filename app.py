@@ -1,3 +1,6 @@
+import numpy as np
+import geopandas as gpd
+import dash_bootstrap_components as dbc
 import json
 import re
 from urllib.request import urlopen
@@ -10,9 +13,8 @@ import plotly.figure_factory as ff
 import plotly.io as pio
 from plotly.subplots import make_subplots
 from dash import Dash, dcc, html, Input, Output, State, callback_context
-import dash_bootstrap_components as dbc
-import geopandas as gpd
-import numpy as np
+import logging
+logger = logging.getLogger(__name__)
 
 print("Lade Daten und initialisiere Dashboard...")
 
@@ -491,14 +493,74 @@ def fig_top5(d):
         x="Oper insgesamt",
         y="Straftat_kurz",
         orientation="h",
-        color="Oper insgesamt",
-        color_continuous_scale="YlOrRd",
         title="Top 5 Deliktsgruppen nach Opferzahl",
         labels={"Oper insgesamt": "Opferzahl",
                 "Straftat_kurz": "Deliktsgruppe"},
     )
+    # use dashboard primary blue for bars
+    fig.update_traces(marker_color="#1a80bb",
+                      textposition="outside", cliponaxis=False)
     fig.update_layout(coloraxis_showscale=False)
     return fig
+
+
+# --- New: Top-5 trend for a selected state (line chart) ---
+def fig_state_top5_trend(d_state, metric_mode="abs"):
+    if d_state.empty:
+        return empty_fig()
+
+    d2 = d_state[d_state["Straftat_kurz"] != "Straftaten insgesamt"].copy()
+    if d2.empty:
+        return empty_fig("Keine Deliktsdaten verfügbar")
+
+    # top-5 by absolute totals
+    top5 = d2.groupby("Straftat_kurz")[
+        "Oper insgesamt"].sum().nlargest(5).index.tolist()
+    g = (
+        d2[d2["Straftat_kurz"].isin(top5)]
+        .groupby(["Jahr", "Straftat_kurz"])["Oper insgesamt"]
+        .sum()
+        .reset_index()
+    )
+
+    state_name = d_state["Bundesland"].iloc[0] if (
+        "Bundesland" in d_state.columns and not d_state["Bundesland"].empty) else ""
+
+    if metric_mode == "rate":
+        # compute per-100k using year-specific population
+        g["Value"] = g.apply(lambda r: per_100k(r["Oper insgesamt"], get_population(
+            state_name, int(r["Jahr"]))) if state_name else 0.0, axis=1)
+        y_label = "Opfer pro 100.000 Einwohner"
+    else:
+        g["Value"] = g["Oper insgesamt"]
+        y_label = "Opferzahl"
+
+    # use blue shades palette consistent with dashboard theme
+    palette = ["#1e40af", "#3b82f6", "#60a5fa", "#93c5fd", "#0ea5e9"]
+    fig = px.line(
+        g,
+        x="Jahr",
+        y="Value",
+        color="Straftat_kurz",
+        markers=True,
+        title=f"Top-5 Deliktsgruppen in {state_name} (Zeitverlauf)",
+        labels={"Value": y_label, "Straftat_kurz": "Deliktsgruppe"},
+        color_discrete_sequence=palette,
+    )
+
+    if metric_mode == "rate":
+        fig.update_traces(
+            hovertemplate="%{x}<br>%{y:.1f} / 100k<extra></extra>")
+    else:
+        fig.update_traces(
+            hovertemplate="%{x}<br>%{y:,.0f} Fälle<extra></extra>")
+
+    fig.update_layout(height=420, plot_bgcolor="white",
+                      margin=dict(l=60, r=30, t=70, b=60))
+    return fig
+
+
+# --- New: Age composition for a selected state ---
 
 
 def fig_donut(d):
@@ -897,8 +959,48 @@ def prepare_state_geo_data(d, value_col="Oper insgesamt", age_group_col=None):
     gdf_merged["Opfer_altersgruppe"] = gdf_merged["Opfer_altersgruppe"].fillna(
         0)
 
+    # --- Compute mean population for the selected years and per-100k (state-level only) ---
+    years = sorted(d["Jahr"].unique()) if "Jahr" in d.columns else []
+
+    def mean_pop_for_state(bl):
+        if POP.empty or not years:
+            return None
+        sub = POP[(POP["Bundesland"] == bl) & (POP["Jahr"].isin(years))]
+        if sub.empty:
+            return None
+        return float(sub["Population"].mean())
+
+    gdf_merged["Population_mean"] = gdf_merged["Bundesland"].apply(
+        mean_pop_for_state)
+
+    def safe_per100k(val, pop):
+        try:
+            return per_100k(val, pop)
+        except Exception:
+            return 0.0
+
+    gdf_merged["Opfer_insgesamt_per100k"] = gdf_merged.apply(
+        lambda r: safe_per100k(r["Opfer_insgesamt"], r["Population_mean"]), axis=1
+    )
+    gdf_merged["Opfer_altersgruppe_per100k"] = gdf_merged.apply(
+        lambda r: safe_per100k(r["Opfer_altersgruppe"], r["Population_mean"]), axis=1
+    )
+
+    # Compute map center robustly
+    try:
+        gdf_projected = gdf_merged.to_crs("EPSG:32632")
+        centroid = gdf_projected.geometry.centroid
+        centroid_wgs84 = centroid.to_crs("EPSG:4326")
+        center_lat = centroid_wgs84.y.mean()
+        center_lon = centroid_wgs84.x.mean()
+    except Exception as e:
+        logger.warning(
+            "Could not compute projected centroid for states: %s", e)
+        center_lat = gdf_merged.geometry.centroid.y.mean()
+        center_lon = gdf_merged.geometry.centroid.x.mean()
+
     geojson_data = json.loads(gdf_merged.to_json())
-    return gdf_merged, geojson_data
+    return gdf_merged, geojson_data, (center_lat, center_lon)
 
 
 def _norm_admin_name(x: str) -> str:
@@ -1098,7 +1200,6 @@ def prepare_city_geo_data(d, selected_state=None, value_col="Oper insgesamt", ag
     return gdf_merged, geojson_data, (center_lat, center_lon)
 
 
-
 # ----- COLOR SCALES FOR SAFETY MODE -----
 COLOR_SCALE_UNSAFE = "Reds"
 # Safe mode: green-only scale, REVERSED so that LOWER crime = DARKER green
@@ -1138,13 +1239,16 @@ def _apply_map_focus(fig: go.Figure, bounds: dict, center: dict, zoom: float):
     return fig
 
 
-def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all", safety_mode="all"):
+def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all", safety_mode="all", metric_mode="abs"):
     """
     Handles BOTH Bundesländer & City view with safety-mode coloring.
     safety_mode:
         - "safe"   → green scale (low = good)
         - "unsafe" → red scale (high = dangerous)
         - "all"    → neutral scale
+    metric_mode:
+        - "abs" -> absolute counts
+        - "rate" -> victims per 100k (states only)
     """
 
     if d.empty or gdf_states is None:
@@ -1163,6 +1267,8 @@ def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all",
     # Metric used for coloring + Top-N ranking
     metric_col = "Opfer_altersgruppe" if age_group_col is not None else "Opfer_insgesamt"
     metric_label = f"Opfer {age_label_for_title}" if age_group_col is not None else "Opfer gesamt"
+    # Flag to indicate per-100k rate mode
+    is_rate = (metric_mode == "rate")
 
     # ----- Choose color scale -----
     if safety_mode == "safe":
@@ -1179,25 +1285,39 @@ def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all",
     # ✅ BUNDESLÄNDER VIEW ----------------------------------------------------
     # ----------------------------------------------------
     if city_mode == "bundesland" and selected_state is None:
-        gdf_states_data, geojson_data = prepare_state_geo_data(
+        gdf_states_data, geojson_data, center = prepare_state_geo_data(
             d, value_col, age_group_col)
         if gdf_states_data is None:
             return empty_fig("Keine Bundeslanddaten verfügbar")
+
+        # If rate mode requested, use per-100k columns (state-level only)
+        if metric_mode == "rate":
+            metric_col = "Opfer_altersgruppe_per100k" if age_group_col is not None else "Opfer_insgesamt_per100k"
+            metric_label = "Opfer pro 100.000 Einwohner"
 
         # Sort by safe/unsafe using metric_col
         gdf_states_data = gdf_states_data.sort_values(
             metric_col, ascending=ascending)
 
-        # Debug: print columns to capture potential duplicates before plotting
-        print('DEBUG: gdf_states_data cols:', list(gdf_states_data.columns))
-        print('DEBUG: gdf_states_data duplicated:',
-              gdf_states_data.columns[gdf_states_data.columns.duplicated()].tolist())
+        # Debug: record columns to logger (debug level, not printed by default)
+        logger.debug('gdf_states_data cols: %s', list(gdf_states_data.columns))
+        logger.debug('gdf_states_data duplicated: %s',
+                     gdf_states_data.columns[gdf_states_data.columns.duplicated()].tolist())
 
-        # Build custom_data avoiding duplicates (metric_col may equal 'Opfer_insgesamt')
-        if age_group != "all":
-            custom_data_states = ["Bundesland", metric_col, "Opfer_insgesamt", "Opfer_altersgruppe"]
+        # Build custom_data avoiding duplicates (include absolute counts when showing rates)
+        if metric_mode == "rate":
+            if age_group != "all":
+                custom_data_states = ["Bundesland", metric_col,
+                                      "Opfer_insgesamt", "Opfer_altersgruppe"]
+            else:
+                custom_data_states = ["Bundesland",
+                                      metric_col, "Opfer_insgesamt"]
         else:
-            custom_data_states = ["Bundesland", metric_col]
+            if age_group != "all":
+                custom_data_states = ["Bundesland", metric_col,
+                                      "Opfer_insgesamt", "Opfer_altersgruppe"]
+            else:
+                custom_data_states = ["Bundesland", metric_col]
         custom_data_states = list(dict.fromkeys(custom_data_states))
 
         try:
@@ -1217,38 +1337,63 @@ def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all",
                 map_style="carto-positron",
                 color_continuous_scale=color_scale,
                 zoom=4.5,
-                center={"lat": 51.0, "lon": 10.2},
+                center={"lat": center[0], "lon": center[1]},
                 title=f"Opfer nach Bundesland – {age_label_for_title}",
             )
         except Exception as e:
-            print("Error creating choropleth for states:", e)
+            logger.error("Error creating choropleth for states: %s", e)
             try:
-                print('gdf_states_data cols:', list(gdf_states_data.columns))
-                print('gdf_states_data duplicated:',
-                      gdf_states_data.columns[gdf_states_data.columns.duplicated()].tolist())
+                logger.debug('gdf_states_data cols: %s',
+                             list(gdf_states_data.columns))
+                logger.debug('gdf_states_data duplicated: %s',
+                             gdf_states_data.columns[gdf_states_data.columns.duplicated()].tolist())
             except Exception:
                 pass
             raise
 
         # Hovertemplate: always show metric_label, total, and age group if selected
-        if age_group != "all":
-            fig.update_traces(
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>"
-                    + f"{metric_label}: %{{customdata[1]:,.0f}}<br>"
-                    + "Opfer gesamt: %{customdata[2]:,.0f}<br>"
-                    + f"Opfer {age_label_for_title}: %{{customdata[3]:,.0f}}<br>"
-                    + "<extra></extra>"
+        if metric_mode == "rate":
+            # show rate (1 decimal) plus the absolute counts
+            if age_group != "all":
+                fig.update_traces(
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        + f"{metric_label}: %{{customdata[1]:.1f}} / 100k<br>"
+                        + "Opfer gesamt: %{customdata[2]:,.0f}<br>"
+                        + f"Opfer {age_label_for_title}: %{{customdata[3]:,.0f}}<br>"
+                        + "<extra></extra>"
+                    )
                 )
-            )
+            else:
+                fig.update_traces(
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        + f"{metric_label}: %{{customdata[1]:.1f}} / 100k<br>"
+                        + "Opfer gesamt: %{customdata[2]:,.0f}<br>"
+                        + "<extra></extra>"
+                    )
+                )
+            # colorbar title: per 100k
+            fig.update_coloraxes(colorbar=dict(title="Opfer / 100k"))
         else:
-            fig.update_traces(
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>"
-                    + f"{metric_label}: %{{customdata[1]:,.0f}}<br>"
-                    + "<extra></extra>"
+            if age_group != "all":
+                fig.update_traces(
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        + f"{metric_label}: %{{customdata[1]:,.0f}}<br>"
+                        + "Opfer gesamt: %{customdata[2]:,.0f}<br>"
+                        + f"Opfer {age_label_for_title}: %{{customdata[3]:,.0f}}<br>"
+                        + "<extra></extra>"
+                    )
                 )
-            )
+            else:
+                fig.update_traces(
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        + f"{metric_label}: %{{customdata[1]:,.0f}}<br>"
+                        + "<extra></extra>"
+                    )
+                )
 
         fig.update_layout(
             margin={"l": 0, "r": 50, "t": 0, "b": 0},
@@ -1330,11 +1475,11 @@ def fig_geo_map(d, selected_state=None, city_mode="bundesland", age_group="all",
             title=f"Opfer – Städteansicht – {age_label_for_title}",
         )
     except Exception as e:
-        print("Error creating choropleth for cities:", e)
+        logger.error("Error creating choropleth for cities: %s", e)
         try:
-            print('gdf_plot cols:', list(gdf_plot.columns))
-            print('gdf_plot duplicated:',
-                  gdf_plot.columns[gdf_plot.columns.duplicated()].tolist())
+            logger.debug('gdf_plot cols: %s', list(gdf_plot.columns))
+            logger.debug('gdf_plot duplicated: %s',
+                         gdf_plot.columns[gdf_plot.columns.duplicated()].tolist())
         except Exception:
             pass
         raise
@@ -1415,15 +1560,15 @@ def fig_geo_state_bar(d):
     # Add formatted label column for value labels
     g["Label"] = g["Oper insgesamt"].apply(format_int)
 
-    # Normalize values for smooth color scaling
+    # Normalize values for color intensity
     min_val = g["Oper insgesamt"].min()
     max_val = g["Oper insgesamt"].max()
     norm = (g["Oper insgesamt"] - min_val) / (max_val - min_val + 1e-9)
 
-    # Create figure
+    # Create figure and add lollipop stems and markers
     fig = go.Figure()
 
-    # --- Lollipop stem (blue-grey color for consistency) ---
+    # Stems
     fig.add_trace(
         go.Scatter(
             x=g["Oper insgesamt"],
@@ -1435,7 +1580,7 @@ def fig_geo_state_bar(d):
         )
     )
 
-    # --- Lollipop dot (blue intensity color) with value labels ---
+    # Dots with value labels
     fig.add_trace(
         go.Scatter(
             x=g["Oper insgesamt"],
@@ -1446,9 +1591,9 @@ def fig_geo_state_bar(d):
             textfont=dict(size=12, color="#0f172a"),
             marker=dict(
                 size=14,
-                color=norm,                         # mapped intensity
-                colorscale="Blues",                 # blue scale
-                showscale=False,                    # hide colorbar
+                color=norm,
+                colorscale="Blues",
+                showscale=False,
                 line=dict(color="#1e40af", width=0.6),
             ),
             hovertemplate="<b>%{y}</b><br>Opfer: %{x}<extra></extra>",
@@ -1456,22 +1601,26 @@ def fig_geo_state_bar(d):
         )
     )
 
-    # Layout styling
+    # Layout styling (tighter margins to remove extra whitespace)
     fig.update_layout(
         title="Opfer nach Bundesland",
         xaxis_title="Opferzahl",
         yaxis_title="Bundesland",
         height=420,
-        margin=dict(l=80, r=20, t=60, b=40),
+        margin=dict(l=60, r=20, t=40, b=40),
         plot_bgcolor="white",
     )
 
     fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb")
     fig.update_yaxes(showgrid=False)
 
-    # Increase x-axis range to give room for value labels
+    # Increase x-axis range but keep it tight around actual values to remove left/right gaps
+    min_x = float(g["Oper insgesamt"].min()) if not g.empty else 0.0
     max_x = float(g["Oper insgesamt"].max()) if not g.empty else 0.0
-    fig.update_xaxes(range=[0, max_x * 1.12 if max_x > 0 else 1])
+    # Use slightly inward lower bound (near smallest value) and slight padding on upper bound
+    lower = min_x * 0.92 if min_x > 0 else 0
+    upper = max_x * 1.02 if max_x > 0 else 1
+    fig.update_xaxes(range=[lower, upper])
 
     return fig
 
@@ -1504,7 +1653,8 @@ def fig_geo_top(d):
 
     # Set static blue color for all bars
     fig.update_traces(
-        marker_color="#1a80bb"  # same blue as Zeitliche Einblicke (Change 2019–2024)
+        # same blue as Zeitliche Einblicke (Change 2019–2024)
+        marker_color="#1a80bb"
     )
     # Show value labels at the end of bars
     fig.update_traces(textposition="outside", cliponaxis=False)
@@ -2263,7 +2413,8 @@ def layout_geo():
                         children=[
                             html.Label("Ansicht"),
                             html.Div(
-                                style={"display": "flex", "alignItems": "center", "gap": "12px"},
+                                style={"display": "flex",
+                                       "alignItems": "center", "gap": "12px"},
                                 children=[
                                     # Back button (appears only on Landkreis level)
                                     html.Div(
@@ -2289,7 +2440,8 @@ def layout_geo():
                                     dcc.RadioItems(
                                         id="geo-city-mode",
                                         options=[
-                                            {"label": " Bundesländer", "value": "bundesland"},
+                                            {"label": " Bundesländer",
+                                                "value": "bundesland"},
                                             {"label": " Städte", "value": "all"},
                                         ],
                                         value="bundesland",
@@ -2333,7 +2485,8 @@ def layout_geo():
 
                     # --- Modus + Aktuelle Ansicht (NO back button here) ---
                     html.Div(
-                        style={"flex": "1", "display": "flex", "flexDirection": "column"},
+                        style={"flex": "1", "display": "flex",
+                               "flexDirection": "column"},
                         children=[
                             html.Label("Modus"),
                             html.Div(
@@ -2346,7 +2499,8 @@ def layout_geo():
                                     dcc.RadioItems(
                                         id="geo-safety-mode",
                                         options=[
-                                            {"label": " Gefährlich", "value": "unsafe"},
+                                            {"label": " Gefährlich",
+                                                "value": "unsafe"},
                                             {"label": " Sicher", "value": "safe"},
                                         ],
                                         value="unsafe",
@@ -2374,6 +2528,7 @@ def layout_geo():
             ),
             # ===== ENDE FILTERLEISTE =====
 
+            # TOP ROW: Map (left) + placeholder for new chart (right)
             dbc.Row(
                 [
                     # LEFT: Map preview (~55%)
@@ -2389,20 +2544,15 @@ def layout_geo():
                         xs=12,
                     ),
 
-                    # RIGHT: Analytical charts (~45%)
+                    # RIGHT: Placeholder for future chart (~45%)
                     dbc.Col(
                         [
                             dcc.Graph(
-                                id="geo-crime-profile",
+                                id="geo-new-chart",
                                 style={"height": "420px"},
                                 config={"displayModeBar": False},
                             ),
-                            html.Div(style={"height": "12px"}),
-                            dcc.Graph(
-                                id="geo-trend",
-                                style={"height": "420px"},
-                                config={"displayModeBar": False},
-                            ),
+
                         ],
                         md=5,
                         xs=12,
@@ -2410,7 +2560,54 @@ def layout_geo():
                 ],
                 className="g-3",
             ),
-        ]
+
+            # BOTTOM SECTION: Wide stacked charts (bar on top, lollipop below)
+            html.Div(style={"height": "36px"}),
+
+            # Full-width bar chart (top)
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            dcc.Graph(
+                                id="geo-crime-profile",
+                                style={"height": "550px"},
+                                config={"displayModeBar": False},
+                            ),
+                        ],
+                        md=12,
+                        xs=12,
+                    ),
+                ],
+                className="g-3",
+            ),
+
+
+            # Full-width lollipop chart (below the bar chart)
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            dcc.Graph(
+                                id="geo-trend",
+                                style={
+                                    "height": "650px", "marginBottom": "0px", "paddingBottom": "0px"},
+                                config={"displayModeBar": False},
+                            ),
+                        ],
+                        md=12,
+                        xs=12,
+                        style={"marginBottom": "0px", "paddingBottom": "0px"},
+                    ),
+                ],
+                className="g-0",
+                style={"marginBottom": "0px",
+                       "paddingBottom": "0px", "--bs-gutter-y": "0px"},
+            ),
+
+
+        ],
+        style={"marginBottom": "0px", "paddingBottom": "0px"},
     )
 
 
@@ -2840,6 +3037,7 @@ def update_selected_state(click_data, back_clicks, filter_states, current_state)
 
 @app.callback(
     Output("map", "figure"),
+    Output("geo-new-chart", "figure"),
     Output("geo-trend", "figure"),
     Output("geo-crime-profile", "figure"),
     Output("current-state-display", "children"),
@@ -2851,9 +3049,10 @@ def update_selected_state(click_data, back_clicks, filter_states, current_state)
     Input("geo-city-mode", "value"),
     Input("geo-age-group", "value"),
     Input("geo-safety-mode", "value"),
+    Input("filter-metric", "value"),
 )
 def update_geo_components(
-    years, crimes, states, selected_state, city_mode, age_group, safety_mode
+    years, crimes, states, selected_state, city_mode, age_group, safety_mode, metric_mode
 ):
     d = filter_data(years or YEARS, crimes or [], states or [])
 
@@ -2863,10 +3062,23 @@ def update_geo_components(
         city_mode=city_mode,
         age_group=age_group,
         safety_mode=safety_mode,
+        metric_mode=metric_mode,
     )
 
     state_bar_fig = fig_geo_state_bar(d)
     top_regions_fig = fig_geo_top(d)
+
+    # New chart: Top-5 crime categories (trend) for selected state
+    if selected_state:
+        df_state = d[d["Bundesland"] == selected_state]
+        if not df_state.empty:
+            geo_new_fig = fig_state_top5_trend(
+                df_state, metric_mode=metric_mode)
+        else:
+            geo_new_fig = empty_fig(f"Keine Daten für {selected_state}")
+    else:
+        geo_new_fig = empty_fig(
+            "Klicke auf ein Bundesland, um die Top-5 Deliktsgruppen anzuzeigen")
 
     # Update info text
     if selected_state:
@@ -2880,7 +3092,7 @@ def update_geo_components(
         )
         back_style = {"display": "none"}
 
-    return map_fig, state_bar_fig, top_regions_fig, text, back_style
+    return map_fig, geo_new_fig, state_bar_fig, top_regions_fig, text, back_style
 
 
 # --------- CRIME TYPES CALLBACK ---------
@@ -2927,8 +3139,11 @@ if __name__ == "__main__":
 # --------- GEO FULL ANALYTICAL CALLBACK ---------
 
 # This callback reads selected-state-store and updates map + the two analytical charts (geo-crime-profile, geo-trend)
+
+
 @app.callback(
     Output("map", "figure"),
+    Output("geo-new-chart", "figure"),
     Output("geo-crime-profile", "figure"),
     Output("geo-trend", "figure"),
     Input("filter-year", "value"),
@@ -2938,11 +3153,12 @@ if __name__ == "__main__":
     Input("geo-age-group", "value"),
     Input("geo-safety-mode", "value"),
     Input("selected-state-store", "data"),
+    Input("filter-metric", "value"),
 )
 def update_geo_full_analysis(
     years, crimes, states,
     geo_city_mode, geo_age_group, geo_safety_mode,
-    selected_state,
+    selected_state, metric_mode
 ):
     # Apply global filters
     d_filtered = filter_data(years, crimes, states)
@@ -2955,6 +3171,7 @@ def update_geo_full_analysis(
             city_mode="bundesland",
             age_group=geo_age_group,
             safety_mode=geo_safety_mode,
+            metric_mode=metric_mode,
         )
         side_df = d_filtered
     else:
@@ -2964,11 +3181,24 @@ def update_geo_full_analysis(
             city_mode="all",
             age_group=geo_age_group,
             safety_mode=geo_safety_mode,
+            metric_mode=metric_mode,
         )
         side_df = d_filtered[d_filtered["Bundesland"] == selected_state]
 
+    # New chart: Top-5 crime categories (trend) for selected state (or hint)
+    if selected_state:
+        df_state = d_filtered[d_filtered["Bundesland"] == selected_state]
+        if not df_state.empty:
+            geo_new_fig = fig_state_top5_trend(
+                df_state, metric_mode=metric_mode)
+        else:
+            geo_new_fig = empty_fig(f"Keine Daten für {selected_state}")
+    else:
+        geo_new_fig = empty_fig(
+            "Klicke auf ein Bundesland, um die Top-5 Deliktsgruppen anzuzeigen")
+
     # Analytical charts (structure + trend)
     crime_profile_fig = fig_top5(side_df)
-    trend_fig = fig_trend(side_df, metric_mode="abs")
+    trend_fig = fig_trend(side_df, metric_mode=metric_mode)
 
-    return map_fig, crime_profile_fig, trend_fig
+    return map_fig, geo_new_fig, crime_profile_fig, trend_fig
