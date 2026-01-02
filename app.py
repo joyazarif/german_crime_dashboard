@@ -206,6 +206,149 @@ CRIME_SYNONYMS = {
 }
 
 
+# --------- DATA CLEANING FUNCTION ---------
+def clean_df(df_all: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Clean and standardize the crime victim dataframe.
+    """
+    report = {
+        "rows_in": int(len(df_all)),
+        "rows_out": None,
+        "dropped_missing_keys": 0,
+        "missing_cols": [],
+        "sanity": {},
+    }
+
+    if df_all is None or df_all.empty:
+        report["rows_out"] = 0
+        return df_all, report
+
+    d = df_all.copy()
+
+    # 1) Standardize column names + trim strings
+    d.columns = [str(c).strip() for c in d.columns]
+    for c in ["Straftat", "Fallstatus", "Stadt/Landkreis", "Bundesland", "Region"]:
+        if c in d.columns:
+            d[c] = d[c].astype(str).str.strip()
+
+    # 2) Geographic keys
+    if "Gemeindeschluessel" in d.columns:
+        d["Gemeindeschluessel"] = pd.to_numeric(d["Gemeindeschluessel"], errors="coerce")
+        d["Bundesland_Code"] = (d["Gemeindeschluessel"] // 1000).astype("Int64")
+        d["Bundesland"] = d["Bundesland_Code"].map(STATE_MAP)
+
+    if "Region" not in d.columns:
+        if "Stadt/Landkreis" in d.columns:
+            d["Region"] = d["Stadt/Landkreis"]
+        else:
+            d["Region"] = "Unbekannt"
+
+    # 3) Fallstatus handling (prefer totals 'insg.'; otherwise sum available statuses)
+    if "Fallstatus" in d.columns:
+        d["Fallstatus"] = d["Fallstatus"].astype(str).str.strip().str.lower()
+    else:
+        report["missing_cols"].append("Fallstatus")
+
+    # If we have multiple fallstatus rows (e.g., voll./vers./insg.), avoid double counting:
+    # - If 'insg.' exists for a group, keep only 'insg.'
+    # - Otherwise (no insg.), sum all statuses (so categories like 2022 sexual 'vers.' are not lost)
+    if "Fallstatus" in d.columns:
+        # Define group keys for deduplication / collapsing
+        group_keys = [
+            c
+            for c in [
+                "Jahr",
+                "Bundesland",
+                "Region",
+                "Stadt/Landkreis",
+                "Straftat",
+                "Straftat_kurz",
+                "Gemeindeschluessel",
+                "Bundesland_Code",
+            ]
+            if c in d.columns
+        ]
+
+        def _collapse_status(g: pd.DataFrame) -> pd.DataFrame:
+            if (g["Fallstatus"] == "insg.").any():
+                g = g[g["Fallstatus"] == "insg."]
+            return g
+
+        # Keep only rows that will contribute, then aggregate numeric victim columns
+        d = (
+            d.groupby(group_keys, dropna=False, as_index=False)
+            .apply(lambda g: _collapse_status(g))
+            .reset_index(drop=True)
+        )
+        # After selecting the contributing rows, collapse duplicates by summing numeric columns
+        numeric_cols = [c for c in d.columns if c == "Oper insgesamt" or str(c).startswith("Opfer ")]
+        if numeric_cols:
+            d = (
+                d.groupby(group_keys, dropna=False)[numeric_cols]
+                .sum()
+                .reset_index()
+            )
+
+    # 4) Crime short names
+    def short(s: str) -> str:
+        s = str(s).strip()
+        for long_name, short_name in CRIME_SYNONYMS.items():
+            if long_name in s:
+                return short_name
+        return s.replace("  ", " ").strip()
+
+    if "Straftat" in d.columns:
+        d["Straftat_kurz"] = d["Straftat"].apply(short)
+    else:
+        report["missing_cols"].append("Straftat")
+        d["Straftat_kurz"] = "Unbekannt"
+
+    # 5) Numeric conversions
+    if "Jahr" in d.columns:
+        d["Jahr"] = pd.to_numeric(d["Jahr"], errors="coerce").astype("Int64")
+    else:
+        report["missing_cols"].append("Jahr")
+
+    victim_like_cols = []
+    for col in d.columns:
+        if col == "Oper insgesamt" or str(col).startswith("Opfer "):
+            victim_like_cols.append(col)
+
+    for col in victim_like_cols:
+        d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0)
+
+    # 6) Drop rows missing essential keys
+    essential = [c for c in ["Bundesland", "Region", "Straftat_kurz", "Jahr"] if c in d.columns]
+    before = len(d)
+    if essential:
+        d = d.dropna(subset=essential).copy()
+    report["dropped_missing_keys"] = int(before - len(d))
+
+    # 7) Sanity checks
+    sanity = {}
+    if "Oper insgesamt" in d.columns and "Opfer maennlich" in d.columns and "Opfer weiblich" in d.columns:
+        mf = d["Opfer maennlich"] + d["Opfer weiblich"]
+        sanity["rows_total_lt_male_female"] = int((d["Oper insgesamt"] < mf).sum())
+    else:
+        sanity["rows_total_lt_male_female"] = None
+
+    age_cols_present = [c for c in AGE_COLS.values() if c in d.columns]
+    if "Oper insgesamt" in d.columns and age_cols_present:
+        age_sum = d[age_cols_present].sum(axis=1)
+        sanity["rows_total_lt_age_sum"] = int((d["Oper insgesamt"] < age_sum).sum())
+    else:
+        sanity["rows_total_lt_age_sum"] = None
+
+    neg_count = 0
+    for col in victim_like_cols:
+        neg_count += int((d[col] < 0).sum())
+    sanity["negative_values_count"] = int(neg_count)
+
+    report["sanity"] = sanity
+    report["rows_out"] = int(len(d))
+
+    return d, report
+
 # --------- LOAD DATA ---------
 def load_data():
     dfs = []
@@ -216,31 +359,9 @@ def load_data():
         dfs.append(df)
 
     df_all = pd.concat(dfs, ignore_index=True)
-    df_all["Bundesland_Code"] = (
-        df_all["Gemeindeschluessel"] // 1000).astype(int)
-    df_all["Bundesland"] = df_all["Bundesland_Code"].map(STATE_MAP)
-
-    # Create a proper Region column (Stadt/Landkreis)
-    if "Stadt/Landkreis" in df_all.columns:
-        df_all["Region"] = df_all["Stadt/Landkreis"]
-    else:
-        # Fallback if column name is different
-        df_all["Region"] = "Unbekannt"
-
-    df_insg = df_all[df_all["Fallstatus"] == "insg."].copy()
-
-    def short(s: str) -> str:
-        s = s.strip()
-
-        for long_name, short_name in CRIME_SYNONYMS.items():
-            if long_name in s:
-                return short_name
-
-    # fallback: clean & shorten safely if unknown
-        return s.replace("  ", " ").strip()
-
-    df_insg["Straftat_kurz"] = df_insg["Straftat"].apply(short)
-    return df_insg
+    df_clean, rep = clean_df(df_all)
+    print("✅ Clean report:", rep)
+    return df_clean
 
 
 df = load_data()
@@ -305,6 +426,7 @@ def format_int(x):
         return "0"
 
 
+
 # --------- KPI CALC ---------
 def build_kpis(d):
     """
@@ -351,25 +473,100 @@ def build_kpis(d):
     adults = max(total_victims - under18, 0)
     under18_adults_str = f"{pct(under18, total_victims)} / {pct(adults, total_victims)}"
 
-    # 5) Anzahl Deliktsgruppen (ohne 'Straftaten insgesamt')
-    if "Straftat_kurz" in d.columns:
-        crime_types = (
-            d.loc[d["Straftat_kurz"] != "Straftaten insgesamt", "Straftat_kurz"]
-            .nunique()
-        )
-    else:
-        crime_types = 0
+    # 5) Stadt mit höchster Kriminalitätsrate (Opfer pro 100k)
+    top_city_rate = kpi_top_city_rate(d)
 
     return (
         format_int(total_victims),
         format_int(victims_per_year),
         male_female_str,
         under18_adults_str,
-        str(crime_types),
+        top_city_rate,
     )
 
 
 # --------- OVERVIEW FIGURES ---------
+# Bubble chart: population vs crime rate Correlation
+def fig_population_correlation(d):
+    """
+    Correlation between population size and crime rate (Bundesland level).
+    """
+    if d.empty:
+        return empty_fig()
+
+    # remove total category
+    d2 = d[d["Straftat_kurz"] != "Straftaten insgesamt"].copy()
+    if d2.empty:
+        return empty_fig()
+
+    # aggregate victims per Bundesland + year
+    g = (
+        d2.groupby(["Bundesland", "Jahr"])["Oper insgesamt"]
+        .sum()
+        .reset_index()
+    )
+
+    # attach population
+    g["Population"] = g.apply(
+        lambda r: get_population(r["Bundesland"], int(r["Jahr"])),
+        axis=1,
+    )
+
+    g = g.dropna(subset=["Population"])
+    if g.empty:
+        return empty_fig("Keine Bevölkerungsdaten verfügbar")
+
+    # aggregate across selected years
+    g2 = (
+        g.groupby("Bundesland")
+        .agg(
+            Victims=("Oper insgesamt", "sum"),
+            Population=("Population", "mean"),
+        )
+        .reset_index()
+    )
+
+    g2["Rate_100k"] = 100000 * g2["Victims"] / g2["Population"]
+
+    # Pearson correlation
+    r = g2[["Population", "Rate_100k"]].corr().iloc[0, 1]
+
+    fig = px.scatter(
+        g2,
+        x="Population",
+        y="Rate_100k",
+        size="Victims",
+        hover_name="Bundesland",
+        trendline="ols",
+        color_discrete_sequence=["#1a80bb"],  # same blue as male victims
+        labels={
+            "Population": "Einwohnerzahl",
+            "Rate_100k": "Opfer pro 100.000 Einwohner",
+        },
+        title=f"Bevölkerung vs. Kriminalitätsrate (r = {r:.2f})",
+    )
+
+    fig.update_traces(
+        marker=dict(
+            opacity=0.8,
+            line=dict(width=1, color="#0f172a"),
+            color="#1a80bb",   # enforce same blue everywhere
+        )
+    )
+
+    fig.update_layout(
+        height=520,
+        plot_bgcolor="white",
+        margin=dict(l=60, r=30, t=70, b=60),
+    )
+
+    fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb")
+    fig.update_yaxes(showgrid=True, gridcolor="#e5e7eb")
+
+    return fig
+
+
+
 def fig_trend(d, metric_mode="abs"):
     """
     Single-line trend chart.
@@ -1704,7 +1901,7 @@ def fig_heatmap(d):
             x=x_years,
             y=y_crimes,
             z=z,
-            colorscale="YlOrRd",   # low=green, high=red (like your screenshot)
+            colorscale="Blues",   # blue scale (consistent with gender comparison chart)
             text=text,
             texttemplate="%{text}",
             textfont=dict(size=10, color="#111827"),
@@ -2369,21 +2566,150 @@ def layout_overview():
                     html.Div(
                         style={**CARD_STYLE, "borderLeft": "6px solid #1e1b4b"},
                         children=[
-                            html.Div("Anzahl Deliktsgruppen",
-                                     style=KPI_LABEL_STYLE),
-                            html.Div(id="kpi-crime-types",
-                                     style=KPI_VALUE_STYLE),
+                            html.Div("Stadt mit höchster Kriminalitätsrate",
+                            style=KPI_LABEL_STYLE),
+                             html.Div(id="kpi-crime-types",
+                            style=KPI_VALUE_STYLE),
                         ],
                     ),
                 ],
             ),
             dcc.Graph(id="trend"),
+
+           
+            dcc.Graph(id="population-correlation"),
+
             html.Br(),
             dcc.Graph(id="gender"),
             html.Br(),
             dcc.Graph(id="crime-pie"),
         ]
     )
+
+# KPI : City with highest victim rate
+def kpi_top_city_rate(d: pd.DataFrame) -> str:
+    """City/Region with the highest victim rate (per 100,000), within current filters."""
+    if d is None or d.empty:
+        return "–"
+
+    d2 = d.copy()
+
+    # remove totals row if present
+    if "Straftat_kurz" in d2.columns:
+        d2 = d2[d2["Straftat_kurz"] != "Straftaten insgesamt"].copy()
+
+    if d2.empty:
+        return "–"
+
+    victim_col = "Oper insgesamt" if "Oper insgesamt" in d2.columns else None
+    if victim_col is None:
+        return "–"
+
+    # Prefer Region + Bundesland (avoids duplicates like Neustadt)
+    group_keys = []
+    if "Region" in d2.columns:
+        group_keys.append("Region")
+    if "Bundesland" in d2.columns:
+        group_keys.append("Bundesland")
+    if not group_keys:
+        return "–"
+
+    victims = (
+        d2.groupby(group_keys, dropna=False)[victim_col]
+        .sum()
+        .reset_index(name="victims")
+    )
+
+    # Try to compute per-100k using a population column if available
+    pop_candidates = [
+        "Einwohner", "Einwohnerzahl", "Bevoelkerung", "Bevölkerung", "Population", "pop"
+    ]
+    pop_col = next((c for c in pop_candidates if c in d2.columns), None)
+
+    if pop_col is not None:
+        pop = (
+            d2.groupby(group_keys, dropna=False)[pop_col]
+            .max()
+            .reset_index(name="population")
+        )
+        merged = victims.merge(pop, on=group_keys, how="left")
+        merged["rate_per_100k"] = np.where(
+            merged["population"] > 0,
+            merged["victims"] / merged["population"] * 100000.0,
+            np.nan,
+        )
+    else:
+        # If we don't have city-population columns, try to approximate using STATE population
+        # (Bundesland population per selected year(s)) from population_states.csv.
+        if "Bundesland" in d2.columns and "Jahr" in d2.columns:
+            years_by_state = (
+                d2[["Bundesland", "Jahr"]]
+                .drop_duplicates()
+                .copy()
+            )
+            years_by_state["Population_state"] = years_by_state.apply(
+                lambda r: get_population(str(r["Bundesland"]), int(r["Jahr"])),
+                axis=1,
+            )
+            pop_state = (
+                years_by_state.dropna(subset=["Population_state"])
+                .groupby("Bundesland")["Population_state"]
+                .sum()
+                .reset_index(name="population")
+            )
+            merged = victims.merge(pop_state, on="Bundesland", how="left")
+            merged["rate_per_100k"] = np.where(
+                merged["population"] > 0,
+                merged["victims"] / merged["population"] * 100000.0,
+                np.nan,
+            )
+        else:
+            merged = victims.copy()
+            merged["rate_per_100k"] = np.nan
+
+        # If we still couldn't compute a rate, look for an existing rate column.
+        rate_candidates = [
+            "Opfer pro 100.000 Einwohner",
+            "Opfer pro 100.000",
+            "Opfer je 100.000",
+            "Rate",
+            "rate",
+            "Victim_rate",
+            "Opfer_rate",
+        ]
+        rate_col = next((c for c in rate_candidates if c in d2.columns), None)
+
+        if rate_col is None:
+            # Last resort: cannot compute rate → show city with highest absolute victims
+            top = victims.sort_values("victims", ascending=False).head(1)
+            if top.empty:
+                return "–"
+            city = str(top.iloc[0].get("Region", ""))
+            bl = str(top.iloc[0].get("Bundesland", ""))
+            return f"{city} ({bl})" if bl and bl != "nan" else city
+
+        rate = (
+            d2.groupby(group_keys, dropna=False)[rate_col]
+            .mean()
+            .reset_index(name="rate_per_100k")
+        )
+        merged = victims.merge(rate, on=group_keys, how="left")
+
+    merged = merged.dropna(subset=["rate_per_100k"]).copy()
+    if merged.empty:
+        return "–"
+
+    top = merged.sort_values("rate_per_100k", ascending=False).head(1)
+    city = str(top.iloc[0].get("Region", ""))
+    bl = str(top.iloc[0].get("Bundesland", ""))
+    rate_val = float(top.iloc[0]["rate_per_100k"])
+
+    # German formatting 1.234,5
+    rate_str = f"{rate_val:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    if bl and bl != "nan":
+        return f"{city} ({bl}) • {rate_str} /100k"
+    return f"{city} • {rate_str} /100k"
 
 
 def layout_geo():
@@ -2626,11 +2952,6 @@ def layout_crime():
             dcc.Graph(id="heat", style={"width": "100%"}, config={
                       "responsive": True}),
             html.Br(),
-
-            dcc.Graph(id="stacked", style={
-                      "width": "100%", "height": f"{STANDARD_HEIGHT}px"}),
-            html.Br(),
-
             html.Div(
                 style={"maxWidth": "500px"},
                 children=[
@@ -2950,6 +3271,7 @@ def update_sidebar_visibility(visible):
         Output("trend", "figure"),
         Output("gender", "figure"),
         Output("crime-pie", "figure"),
+        Output("population-correlation", "figure"),
     ],
     [
         Input("filter-year", "value"),
@@ -2970,6 +3292,7 @@ def update_overview(years, crimes, states, metric_mode):
     metric_mode = metric_mode or "abs"
 
     d_filtered = filter_data(years, crimes, states)
+    fig_corr = fig_population_correlation(d_filtered)
 
     # KPIs (still absolute — KPIs usually should not be rate-based)
     kpi1, kpi2, kpi3, kpi4, kpi5 = build_kpis(d_filtered)
@@ -2988,6 +3311,7 @@ def update_overview(years, crimes, states, metric_mode):
         trend_fig,
         gender_fig,
         pie_fig,
+        fig_corr,
     )
 
 
@@ -3098,7 +3422,6 @@ def update_geo_components(
 # --------- CRIME TYPES CALLBACK ---------
 @app.callback(
     Output("heat", "figure"),
-    Output("stacked", "figure"),
     Output("agechart", "figure"),
     Output("top5-crime", "figure"),
     Input("filter-year", "value"),
@@ -3114,7 +3437,7 @@ def update_crime(years, crimes, states, age_crime_sel):
     age_fig = fig_age(d, age_crime_sel)
     top5_fig = fig_top5(d)
 
-    return heat_fig, stacked_fig, age_fig, top5_fig
+    return heat_fig, age_fig, top5_fig
 
 
 # --------- TEMPORAL CALLBACK ---------
