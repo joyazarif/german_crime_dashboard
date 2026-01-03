@@ -94,39 +94,43 @@ CONTENT_STYLE = {
 
 CARD_STYLE = {
     "backgroundColor": "#ffffff",
-    "borderRadius": "14px",
-    "padding": "12px 14px",
+    "borderRadius": "12px",
+    "padding": "8px 10px",          # ⬅ tighter
     "border": "1px solid #e5e7eb",
-    "boxShadow": "0 6px 18px rgba(15, 23, 42, 0.08)",
+    "boxShadow": "0 4px 12px rgba(15, 23, 42, 0.06)",
     "color": "#0f172a",
-    "minHeight": "78px",
+    "minHeight": "60px",            # ⬅ smaller height
     "display": "flex",
     "flexDirection": "column",
     "justifyContent": "center",
-    "transition": "transform 120ms ease, box-shadow 120ms ease",
+    "minWidth": 0,
+    "overflow": "hidden",
 }
 
 KPI_GRID_STYLE = {
     "display": "grid",
-    "gridTemplateColumns": "repeat(auto-fit, minmax(220px, 1fr))",
-    "gap": "12px",
+    "gridTemplateColumns": "repeat(5, minmax(0, 1fr))",  # ✅ always 5 cards in one row
+    "gap": "8px",
     "marginBottom": "14px",
+    "alignItems": "stretch",
 }
 
 KPI_VALUE_STYLE = {
-    "fontSize": "24px",
+    "fontSize": "20px",     # ⬅ was 24
     "fontWeight": "800",
     "letterSpacing": "-0.3px",
     "lineHeight": "1.05",
 }
+
 KPI_LABEL_STYLE = {
-    "fontSize": "12px",
+    "fontSize": "11px",     # ⬅ was 12
     "fontWeight": "600",
     "color": "#475569",
     "textTransform": "uppercase",
-    "letterSpacing": "0.6px",
-    "marginBottom": "6px",
+    "letterSpacing": "0.5px",
+    "marginBottom": "4px",
 }
+
 STANDARD_HEIGHT = 750
 
 # --------- DATA META ---------
@@ -699,8 +703,7 @@ def fig_top5(d):
                       textposition="outside", cliponaxis=False)
     fig.update_layout(
         coloraxis_showscale=False,
-        height=550
-    )
+        height=500    )
     return fig
 
 
@@ -1898,6 +1901,7 @@ def fig_heatmap(d):
 
     # text inside cells
     text = np.vectorize(lambda v: f"{int(v):,}".replace(",", "."))(z)
+    
 
     fig = go.Figure(
         data=go.Heatmap(
@@ -1905,9 +1909,6 @@ def fig_heatmap(d):
             y=y_crimes,
             z=z,
             colorscale="Blues",   # blue scale (consistent with gender comparison chart)
-            text=text,
-            texttemplate="%{text}",
-            textfont=dict(size=10, color="#111827"),
             hovertemplate="<b>%{y}</b><br>Jahr: %{x}<br>Opfer: %{z:,}<extra></extra>",
             xgap=1,  # grid gaps (like the image)
             ygap=1,
@@ -1915,6 +1916,25 @@ def fig_heatmap(d):
         )
     )
 
+    # --- Dynamic text color (white on dark cells, black on light cells) ---
+    # --- Dynamic text color (white on dark cells, black on light cells) ---
+    z_min = float(np.nanmin(z))
+    z_max = float(np.nanmax(z))
+    threshold = z_min + 0.60 * (z_max - z_min)  # tweak 0.60 → 0.55/0.65 if needed
+
+    for i, crime in enumerate(y_crimes):
+        for j, year in enumerate(x_years):
+            val = z[i, j]
+            label = text[i, j]
+            font_color = "white" if val >= threshold else "#111827"
+
+            fig.add_annotation(
+                x=year,
+                y=crime,
+                text=label,
+                showarrow=False,
+                font=dict(size=10, color=font_color),
+            )
     n_rows = max(1, len(y_crimes))
     fig.update_layout(
         title="Heatmap – Opferzahlen nach Deliktsgruppe und Jahr",
@@ -2264,7 +2284,7 @@ def fig_age(d, crime):
 
 
 # --------- TEMPORAL FIGURES ---------
-
+# Diverging bar chart: change in total victims by state (first vs last year)
 def fig_diverg(d):
     if d.empty:
         return empty_fig()
@@ -2341,8 +2361,101 @@ def fig_diverg(d):
     )
 
     return fig
+# Δ Crime Structure: change in victim counts by crime type between last two years
+def fig_crime_structure_delta(d):
+    """
+    Δ Crime Structure:
+    Change in victim counts by crime type between the last two selected years.
+    Positive = increase (red), Negative = decrease (green)
+    """
+    if d.empty or "Jahr" not in d.columns:
+        return empty_fig("Keine Daten verfügbar")
 
+    # Exclude total category
+    d2 = d[d["Straftat_kurz"] != "Straftaten insgesamt"].copy()
+    if d2.empty:
+        return empty_fig("Keine Deliktsdaten verfügbar")
 
+    years = sorted(d2["Jahr"].unique())
+    if len(years) < 2:
+        return empty_fig("Mindestens zwei Jahre notwendig")
+
+    last_year = years[-1]
+    prev_year = years[-2]
+
+    g_last = (
+        d2[d2["Jahr"] == last_year]
+        .groupby("Straftat_kurz")["Oper insgesamt"]
+        .sum()
+    )
+
+    g_prev = (
+        d2[d2["Jahr"] == prev_year]
+        .groupby("Straftat_kurz")["Oper insgesamt"]
+        .sum()
+    )
+
+    delta = (g_last - g_prev).dropna().sort_values()
+
+    if delta.empty:
+        return empty_fig("Keine Vergleichsdaten verfügbar")
+
+    df = delta.reset_index()
+    df.columns = ["Straftat_kurz", "Delta"]
+
+    # Format labels (German thousands)
+    df["Label"] = df["Delta"].apply(
+        lambda x: f"+{int(x):,}".replace(",", ".") if x > 0 else f"{int(x):,}".replace(",", ".")
+    )
+
+    colors = ["#d97706" if x < 0 else "#1a80bb" for x in df["Delta"]]
+
+    fig = go.Figure(
+    go.Bar(
+        x=df["Delta"],
+        y=df["Straftat_kurz"],
+        orientation="h",
+        marker=dict(color=colors),
+        text=df["Label"],
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            f"Δ Opfer {prev_year} → {last_year}: %{{x:,}}"
+            "<extra></extra>"
+        ),
+    )
+)
+
+    # Zero reference line
+    fig.add_vline(x=0, line_width=2, line_color="#0f172a")
+
+    max_abs = float(df["Delta"].abs().max())
+    pad = max_abs * 0.2 if max_abs > 0 else 1
+
+    fig.update_layout(
+        title=f"Strukturelle Veränderung der Deliktsgruppen ({prev_year} → {last_year})",
+        xaxis_title="Δ Opferzahl",
+        yaxis_title="Deliktsgruppe",
+        height=max(420, 26 * len(df)),
+        margin=dict(l=220, r=80, t=60, b=40),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+
+    fig.update_xaxes(
+        range=[-max_abs - pad, max_abs + pad],
+        showgrid=True,
+        gridcolor="#e5e7eb",
+        zeroline=False,
+        tickformat=",",
+    )
+
+    fig.update_yaxes(showgrid=False)
+
+    return fig
+
+# --------- GENDER COMPARISON FIGURE ---------
 def fig_gender(d):
     """
     Diverging dot plot (mirrored lollipop) in the same visual style as the reference image:
@@ -2609,6 +2722,8 @@ def layout_overview():
             dcc.Graph(id="gender"),
             html.Br(),
             dcc.Graph(id="crime-pie"),
+            
+
         ]
     )
 
@@ -2741,8 +2856,16 @@ def kpi_top_city_rate(d: pd.DataFrame) -> str:
 def layout_geo():
     return html.Div(
         children=[
-            html.H2("Geografische Analyse", className="mb-3"),
-
+            html.H2("Geografische Analyse", className="mb-3",style={"textAlign": "center"},),
+            html.Div(
+            style={
+                "width": "80px",
+                "height": "3px",
+                "backgroundColor": "#1a80bb",
+                "margin": "0 auto 18px auto",
+                "borderRadius": "2px",
+            }
+        ),
             # Store bleibt, weil wir weiterhin per Klick Bundesland auswählen
             dcc.Store(id="selected-state-store", data=None),
 
@@ -2966,15 +3089,16 @@ def layout_geo():
 def layout_crime():
     return html.Div(
         children=[
-            html.H2("Crime Types (Deliktsstruktur)", className="mb-3"),
-            html.P(
-                "Analyse der Opferzahlen nach Deliktsgruppen sowie der Altersstruktur der Opfer.",
-                className="text-muted",
-            ),
-
-            dcc.Graph(
-                id="top5-crime", style={"width": "100%", "height": f"{STANDARD_HEIGHT}px"}),
-            html.Br(),
+            html.H2("Crime Types (Deliktsstruktur)", className="mb-3",style={"textAlign": "center"},),
+            html.Div(
+            style={
+                "width": "80px",
+                "height": "3px",
+                "backgroundColor": "#1a80bb",
+                "margin": "0 auto 18px auto",
+                "borderRadius": "2px",
+            }
+        ),
             dcc.Graph(id="heat", style={"width": "100%"}, config={
                       "responsive": True}),
             html.Br(),
@@ -3003,13 +3127,30 @@ def layout_crime():
 def layout_temporal():
     return html.Div(
         children=[
-            html.H2("Zeitliche Einblicke", className="mb-3"),
-            html.P(
-                "Dynamik der Opferzahlen im Ländervergleich sowie geschlechtsspezifische Muster.",
-                className="text-muted",
+            html.H2("Zeitliche Einblicke", className="mb-3",style={"textAlign": "center"},),
+            html.Div(
+            style={
+                "width": "80px",
+                "height": "3px",
+                "backgroundColor": "#1a80bb",
+                "margin": "0 auto 18px auto",
+                "borderRadius": "2px",
+            }
+        ),
+
+            # 🔹 Structural change by crime type (YoY)
+            dcc.Graph(
+                id="crime-structure-delta",
+                config={"displayModeBar": False},
             ),
+
             html.Br(),
-            dcc.Graph(id="diverg"),
+
+            # 🔹 Diverging change by Bundesland
+            dcc.Graph(
+                id="diverg",
+                config={"displayModeBar": False},
+            ),
         ]
     )
 
@@ -3296,6 +3437,7 @@ def update_sidebar_visibility(visible):
         Output("gender", "figure"),
         Output("crime-pie", "figure"),
         Output("population-correlation", "figure"),
+        
     ],
     [
         Input("filter-year", "value"),
@@ -3316,13 +3458,15 @@ def update_overview(years, crimes, states, metric_mode):
     metric_mode = metric_mode or "abs"
 
     d_filtered = filter_data(years, crimes, states)
+
     fig_corr = fig_population_correlation(d_filtered)
 
-    # KPIs (still absolute — KPIs usually should not be rate-based)
+    # KPIs
     kpi1, kpi2, kpi3, kpi4, kpi5 = build_kpis(d_filtered)
 
     # Figures
-    trend_fig = fig_trend(d_filtered, metric_mode=metric_mode)  # ✅ NEW
+    
+    trend_fig = fig_trend(d_filtered, metric_mode=metric_mode)
     gender_fig = fig_gender(d_filtered)
     pie_fig = fig_crime_pie(d_filtered)
 
@@ -3331,11 +3475,11 @@ def update_overview(years, crimes, states, metric_mode):
         kpi2,
         kpi3,
         kpi4,
-        kpi5,
-        trend_fig,
-        gender_fig,
-        pie_fig,
-        fig_corr,
+        kpi5, 
+        trend_fig,         # ✅ 7th output
+        gender_fig,        # ✅ 8th output
+        pie_fig,           # ✅ 9th output
+        fig_corr,          # ✅ 10th output
     )
 
 
@@ -3447,7 +3591,6 @@ def update_geo_components(
 @app.callback(
     Output("heat", "figure"),
     Output("agechart", "figure"),
-    Output("top5-crime", "figure"),
     Input("filter-year", "value"),
     Input("filter-crime", "value"),
     Input("filter-state", "value"),
@@ -3459,24 +3602,26 @@ def update_crime(years, crimes, states, age_crime_sel):
     heat_fig = fig_heatmap(d)
     stacked_fig = fig_stacked(d)
     age_fig = fig_age(d, age_crime_sel)
-    top5_fig = fig_top5(d)
 
-    return heat_fig, age_fig, top5_fig
+    return heat_fig, age_fig
 
 
 # --------- TEMPORAL CALLBACK ---------
 
 
 @app.callback(
-    
+    Output("crime-structure-delta", "figure"),
     Output("diverg", "figure"),
     Input("filter-year", "value"),
     Input("filter-crime", "value"),
     Input("filter-state", "value"),
 )
 def update_temporal(years, crimes, states):
-    d = filter_data(years or YEARS, crimes or [], states or [])
-    return  fig_diverg(d)
+    d_filtered = filter_data(years, crimes, states)
+    return (
+        fig_crime_structure_delta(d_filtered),
+        fig_diverg(d_filtered),
+    )
 
 
 if __name__ == "__main__":
