@@ -2602,6 +2602,7 @@ def sidebar_layout(path):
                             nav_link("Geografisch", "/geo"),
                             nav_link("Deliktskategorien", "/crime"),
                             nav_link("Zeitliche Einblicke", "/temporal"),
+                            nav_link("Korrelationsanalyse", "/correlations"),
                         ],
                         vertical=True,
                         pills=True,
@@ -3299,6 +3300,132 @@ def fig_fastest_growing_crimes(d):
     return fig
 
 
+# --------- CORRELATIONS PAGE FIGURE ---------
+def fig_crime_correlation_matrix(d):
+    """
+    Pearson correlation matrix between crime categories
+    (based on total victims per state × year).
+
+    Parameters
+    ----------
+    d : pd.DataFrame
+        Crime data with columns: Bundesland, Jahr, Straftat_kurz, Oper insgesamt.
+    """
+    if d.empty:
+        return empty_fig("Keine Daten verfügbar")
+
+    d2 = d[d["Straftat_kurz"] != "Straftaten insgesamt"].copy()
+    if d2.empty:
+        return empty_fig("Keine Deliktsdaten verfügbar")
+
+    g = (
+        d2.groupby(["Bundesland", "Jahr", "Straftat_kurz"])["Oper insgesamt"]
+        .sum()
+        .reset_index()
+    )
+    pivot = g.pivot_table(
+        index=["Bundesland", "Jahr"],
+        columns="Straftat_kurz",
+        values="Oper insgesamt",
+        aggfunc="sum",
+    ).fillna(0)
+
+    if pivot.shape[1] < 2:
+        return empty_fig("Nicht genug Deliktsgruppen für Korrelationsanalyse")
+
+    corr = pivot.corr(method="pearson")
+
+    x_labels = corr.columns.tolist()
+    y_labels = corr.index.tolist()
+    z = corr.values
+
+    text = np.vectorize(lambda v: "" if pd.isna(v) else f"{v:.2f}")(z)
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            x=x_labels,
+            y=y_labels,
+            z=z,
+            text=text,
+            texttemplate="%{text}",
+            textfont=dict(size=9, color="#111827"),
+            colorscale="RdBu",
+            zmid=0,
+            zmin=-1,
+            zmax=1,
+            hovertemplate=(
+                "<b>%{y}</b> × <b>%{x}</b><br>"
+                "Pearson r: %{z:.3f}<extra></extra>"
+            ),
+            xgap=1,
+            ygap=1,
+            colorbar=dict(
+                title="r (Pearson)",
+                tickvals=[-1, -0.5, 0, 0.5, 1],
+            ),
+        )
+    )
+
+    n = len(x_labels)
+    fig.update_layout(
+        title="Korrelationsmatrix – Zusammenhang zwischen Deliktsgruppen",
+        height=max(600, 30 * n + 200),
+        margin=dict(l=220, r=30, t=70, b=220),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    fig.update_xaxes(tickangle=-45, showgrid=False)
+    fig.update_yaxes(autorange="reversed", showgrid=False)
+
+    return fig
+
+
+# --------- CORRELATIONS PAGE LAYOUT ---------
+def layout_correlations():
+    """Returns the Korrelationsanalyse page layout with three correlation visualizations:
+    population vs. crime rate scatter, age × crime risk heatmap, and a crime correlation matrix.
+    """
+    return html.Div(
+        children=[
+            html.H2("Korrelationsanalyse", className="mb-3", style={"textAlign": "center"}),
+            html.Div(
+                style={
+                    "width": "80px",
+                    "height": "3px",
+                    "backgroundColor": "#1a80bb",
+                    "margin": "0 auto 18px auto",
+                    "borderRadius": "2px",
+                }
+            ),
+            html.P(
+                "Statistische Zusammenhänge zwischen Bevölkerung, Altersgruppen und Deliktsstrukturen.",
+                className="text-muted mb-4",
+                style={"textAlign": "center"},
+            ),
+            dbc.Row([
+                dbc.Col(
+                    dcc.Graph(id="corr-population", config={"displayModeBar": False}),
+                    width=12,
+                )
+            ]),
+            html.Br(),
+            dbc.Row([
+                dbc.Col(
+                    dcc.Graph(id="corr-age-risk", config={"displayModeBar": False}),
+                    width=12,
+                )
+            ]),
+            html.Br(),
+            dbc.Row([
+                dbc.Col(
+                    dcc.Graph(id="corr-matrix", config={"displayModeBar": False}),
+                    width=12,
+                )
+            ]),
+        ]
+    )
+
+
 # --------- ROOT LAYOUT (HEADER + SIDEBAR + CONTENT) ---------
 app.layout = html.Div(
     children=[
@@ -3621,6 +3748,28 @@ def update_temporal(years, crimes, states):
     return (
         fig_crime_structure_delta(d_filtered),
         fig_diverg(d_filtered),
+    )
+
+
+# --------- CORRELATIONS CALLBACK ---------
+@app.callback(
+    Output("corr-population", "figure"),
+    Output("corr-age-risk", "figure"),
+    Output("corr-matrix", "figure"),
+    Input("filter-year", "value"),
+    Input("filter-crime", "value"),
+    Input("filter-state", "value"),
+)
+def update_correlations(years, crimes, states):
+    """Update the three correlation figures based on the global sidebar filters.
+
+    Returns a tuple of (population_correlation_fig, age_risk_heatmap_fig, crime_correlation_matrix_fig).
+    """
+    d = filter_data(years or YEARS, crimes or [], states or [])
+    return (
+        fig_population_correlation(d),
+        fig_age_crime_risk_heatmap(d),
+        fig_crime_correlation_matrix(d),
     )
 
 
